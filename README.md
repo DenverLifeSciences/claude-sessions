@@ -20,7 +20,7 @@ Each line shows the session's age, project directory, git branch (when not main/
 Dependencies: `fzf` (`brew install fzf`) and `python3` (ships with macOS).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/daksh-dls/claude-sessions/main/claude-sessions -o /usr/local/bin/claude-sessions
+curl -fsSL https://raw.githubusercontent.com/DenverLifeSciences/claude-sessions/main/claude-sessions -o /usr/local/bin/claude-sessions
 chmod +x /usr/local/bin/claude-sessions
 ```
 
