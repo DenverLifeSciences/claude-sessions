@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# claude-sessions — cross-project Claude Code session picker.
+#
+# Lists every session under ~/.claude/projects (all directories, newest first)
+# in fzf. Enter opens the highlighted session in its own window running
+# `claude --resume <id>` interactively (so its summary-vs-full prompt appears
+# there), while the picker stays open for the next one:
+#   - inside tmux  -> new tmux window
+#   - otherwise    -> new TAB in the current iTerm window (Terminal.app fallback)
+#
+# Keys: enter=open  ctrl-r=refresh  esc=quit
+set -euo pipefail
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo claude)}"
+MAX_SESSIONS="${CLAUDE_SESSIONS_MAX:-300}"
+
+# ---------------------------------------------------------------- list -----
+# Emits tab-separated lines: session_id <TAB> cwd <TAB> jsonl_path <TAB> display
+# $1 = "all" (default) or "main" (hide teammate/agent sessions)
+list_sessions() {
+  python3 - "$MAX_SESSIONS" "${1:-all}" <<'PY'
+import glob, json, os, re, signal, sys, time
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+max_n, mode = int(sys.argv[1]), sys.argv[2]
+root = os.path.expanduser("~/.claude/projects")
+files = [f for f in glob.glob(os.path.join(root, "*", "*.jsonl"))
+         if not os.path.basename(f).startswith("agent-")]
+files.sort(key=os.path.getmtime, reverse=True)
+
+DIM, CYAN, YELLOW, MAGENTA, RESET = "\033[2m", "\033[36m", "\033[33m", "\033[35m", "\033[0m"
+
+def age(ts):
+    s = int(time.time() - ts)
+    if s < 3600: return f"{s // 60}m"
+    if s < 86400: return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+def first_text(content):
+    if isinstance(content, str): return content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                return part.get("text", "")
+    return ""
+
+shown = 0
+home = os.path.expanduser("~")
+for f in files:
+    if shown >= max_n: break
+    sid = cwd = branch = agent = ""
+    title = summary = raw = ""
+    try:
+        with open(f, errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 40 or (title and cwd): break
+                try: e = json.loads(line)
+                except Exception: continue
+                if e.get("type") == "summary" and not summary:
+                    summary = e.get("summary", "")
+                if e.get("type") == "user" and not e.get("isSidechain"):
+                    sid = sid or e.get("sessionId", "")
+                    cwd = cwd or e.get("cwd", "")
+                    branch = branch or (e.get("gitBranch") or "")
+                    agent = agent or (e.get("agentName") or "")
+                    if not title:
+                        t = first_text(e.get("message", {}).get("content", "")).strip()
+                        if t.startswith("Caveat:"):
+                            t = t.split("\n", 1)[-1].strip()
+                        raw = raw or t
+                        if t and not t.startswith("<"):
+                            title = t
+    except OSError:
+        continue
+    if not sid or not cwd:
+        continue
+    is_agent = bool(agent) and agent != "team-lead"
+    if mode == "main" and is_agent:
+        continue
+    if not title and raw:  # e.g. teammate prompts wrapped in injected <tags>
+        title = re.sub(r"<[^>]*>", " ", raw)
+    title = " ".join((title or summary or "(no message)").split())[:120]
+    proj = cwd.replace(home, "~")
+    if len(proj) > 34: proj = "…" + proj[-33:]
+    br = f" {YELLOW}{branch[:14]}{RESET}" if branch and branch not in ("main", "master", "HEAD") else ""
+    tag = f" {MAGENTA}⛭ {agent[:18]}{RESET}" if is_agent else ""
+    display = (f"{DIM}{age(os.path.getmtime(f)):>3}{RESET} "
+               f"{CYAN}{proj:<34}{RESET}{tag}{br} {title}")
+    print(f"{sid}\t{cwd}\t{f}\t{display}")
+    shown += 1
+PY
+}
+
+# ------------------------------------------------------------- preview -----
+preview_session() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+size = os.path.getsize(path)
+with open(path, "rb") as fh:
+    if size > 300_000:
+        fh.seek(-300_000, 2)
+        fh.readline()  # drop partial line
+    lines = fh.read().decode(errors="replace").splitlines()
+
+BOLD, GREEN, BLUE, RESET = "\033[1m", "\033[32m", "\033[34m", "\033[0m"
+out = []
+for line in lines:
+    try: e = json.loads(line)
+    except Exception: continue
+    role = e.get("type")
+    if role not in ("user", "assistant") or e.get("isSidechain"): continue
+    c = e.get("message", {}).get("content", "")
+    if isinstance(c, list):
+        c = "\n".join(p.get("text", "") for p in c
+                      if isinstance(p, dict) and p.get("type") == "text")
+    if not isinstance(c, str) or not c.strip() or c.startswith("<"): continue
+    tag = f"{GREEN}{BOLD}user{RESET}" if role == "user" else f"{BLUE}{BOLD}claude{RESET}"
+    out.append(f"{tag}: {c.strip()[:600]}")
+print(f"\n\n".join(out[-15:]) or "(no readable messages)")
+PY
+}
+
+# ---------------------------------------------------------------- open -----
+open_one() {
+  local id="$1" cwd="$2"
+  [ -d "$cwd" ] || cwd="$HOME"
+  if [ -n "${TMUX:-}" ]; then
+    tmux new-window -c "$cwd" -n "$(basename "$cwd")" "$CLAUDE_BIN --resume $id"
+  elif [ "${TERM_PROGRAM:-}" = "iTerm.app" ] || ps -axo comm | grep -q "MacOS/iTerm2$"; then
+    osascript - "$cwd" "$id" "$CLAUDE_BIN" <<'EOF' >/dev/null
+on run argv
+  set theCmd to "cd " & quoted form of item 1 of argv & " && " & item 3 of argv & " --resume " & item 2 of argv
+  tell application "iTerm"
+    activate
+    if (count of windows) is 0 then
+      create window with default profile
+    else
+      tell current window to create tab with default profile
+    end if
+    tell current session of current window to write text theCmd
+  end tell
+end run
+EOF
+  else
+    osascript - "$cwd" "$id" "$CLAUDE_BIN" <<'EOF' >/dev/null
+on run argv
+  set theCmd to "cd " & quoted form of item 1 of argv & " && " & item 3 of argv & " --resume " & item 2 of argv
+  tell application "Terminal"
+    activate
+    do script theCmd
+  end tell
+end run
+EOF
+  fi
+}
+
+open_line() {  # $1 = file containing the highlighted tab-delimited line
+  IFS=$'\t' read -r id cwd _rest < "$1"
+  [ -n "$id" ] && open_one "$id" "$cwd"
+}
+
+# ---------------------------------------------------------------- main -----
+case "${1:-}" in
+  --list)       list_sessions "${2:-all}" ;;
+  --preview)    preview_session "$2" ;;
+  --open-line)  open_line "$2" ;;
+  *)
+    list_sessions | fzf --ansi --delimiter '\t' --with-nth 4.. \
+      --no-sort --layout=reverse --info=inline \
+      --header 'enter: open in new tab (picker stays)  |  ctrl-a: hide/show ⛭ agents  |  ctrl-r: refresh  |  esc: quit' \
+      --preview "'$SELF' --preview {3}" --preview-window 'right,50%,wrap' \
+      --bind "enter:execute-silent('$SELF' --open-line {f})" \
+      --bind "ctrl-r:reload('$SELF' --list all)" \
+      --bind "ctrl-a:transform:[ \"\$FZF_PROMPT\" = 'main> ' ] \
+        && echo \"change-prompt(> )+reload('$SELF' --list all)\" \
+        || echo \"change-prompt(main> )+reload('$SELF' --list main)\"" \
+      >/dev/null || true
+    ;;
+esac
