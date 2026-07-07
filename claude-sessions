@@ -168,6 +168,7 @@ open_line() {  # $1 = file containing the highlighted tab-delimited line
 # undone with --restore-crash. Skips writing when iTerm has no tabs, so a
 # post-reboot run never clobbers the last good snapshot.
 SNAPSHOT_FILE="${CLAUDE_SESSIONS_SNAPSHOT:-$HOME/.claude/terminal-snapshot.json}"
+SNAPSHOT_DIR="${CLAUDE_SESSIONS_SNAPSHOT_DIR:-$HOME/.claude/terminal-snapshots}"
 
 snapshot_state() {
   local dump
@@ -185,10 +186,10 @@ end tell
 return out
 EOF
 ) || true
-  SNAP_DUMP="$dump" python3 - "$SNAPSHOT_FILE" <<'PY'
-import json, os, re, subprocess, sys, time
+  SNAP_DUMP="$dump" python3 - "$SNAPSHOT_FILE" "$SNAPSHOT_DIR" <<'PY'
+import glob, json, os, re, subprocess, sys, time
 
-out_path = sys.argv[1]
+out_path, snap_dir = sys.argv[1], sys.argv[2]
 tabs = []
 for line in os.environ.get("SNAP_DUMP", "").splitlines():
     if "|" not in line: continue
@@ -246,24 +247,44 @@ for line in os.environ.get("SNAP_DUMP", "").splitlines():
             pass
     tabs.append({"window": win.strip(), "cwd": cwd, "claudeSession": sid})
 
-if tabs:  # never overwrite a good snapshot with an empty one
-    json.dump({"takenAt": int(time.time()), "tabs": tabs}, open(out_path, "w"), indent=1)
-    print(f"snapshot: {len(tabs)} tab(s) -> {out_path}")
-else:
-    print("snapshot: no iTerm tabs found; keeping previous snapshot")
+if not tabs:  # never overwrite a good snapshot with an empty one
+    print("snapshot: no iTerm tabs found; keeping previous snapshots")
+    sys.exit(0)
+
+os.makedirs(snap_dir, exist_ok=True)
+history = sorted(glob.glob(os.path.join(snap_dir, "*.json")))
+if history:
+    try:
+        if json.load(open(history[-1])).get("tabs") == tabs:
+            print(f"snapshot: unchanged ({len(tabs)} tab(s)); keeping {history[-1]}")
+            sys.exit(0)
+    except Exception:
+        pass
+
+data = {"takenAt": int(time.time()), "tabs": tabs}
+hist_path = os.path.join(snap_dir, f"{data['takenAt']}.json")
+json.dump(data, open(hist_path, "w"), indent=1)
+json.dump(data, open(out_path, "w"), indent=1)  # "latest" pointer
+for old in history[:-100]:  # keep last ~100 distinct states
+    os.remove(old)
+print(f"snapshot: {len(tabs)} tab(s) -> {hist_path}")
 PY
 }
 
-restore_crash() {
-  python3 - "$SNAPSHOT_FILE" "$CLAUDE_BIN" <<'PY'
-import json, os, shlex, subprocess, sys, time
+restore_crash() {  # $1 (optional) = specific snapshot file; default: newest
+  python3 - "${1:-}" "$SNAPSHOT_FILE" "$SNAPSHOT_DIR" "$CLAUDE_BIN" <<'PY'
+import glob, json, os, shlex, subprocess, sys, time
 
-path, claude_bin = sys.argv[1], sys.argv[2]
-if not os.path.exists(path):
-    sys.exit("no snapshot found at " + path)
+arg, latest, snap_dir, claude_bin = sys.argv[1:5]
+path = arg
+if not path:
+    history = sorted(glob.glob(os.path.join(snap_dir, "*.json")))
+    path = history[-1] if history else latest
+if not path or not os.path.exists(path):
+    sys.exit("no snapshot found (looked in %s and %s)" % (snap_dir, latest))
 snap = json.load(open(path))
 age_min = (time.time() - snap["takenAt"]) / 60
-print(f"restoring {len(snap['tabs'])} tab(s) from snapshot taken {age_min:.0f} min ago")
+print(f"restoring {len(snap['tabs'])} tab(s) from {path} (taken {age_min:.0f} min ago)")
 
 script = ['tell application "iTerm"', "activate"]
 last_win = None
@@ -286,13 +307,48 @@ for tab in snap["tabs"]:
 PY
 }
 
+pick_snapshot() {  # browse snapshot history in fzf, restore the chosen one
+  local chosen
+  chosen=$(python3 - "$SNAPSHOT_DIR" <<'PY'
+import glob, json, os, sys, time
+for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.json")), reverse=True):
+    try: s = json.load(open(f))
+    except Exception: continue
+    mins = int((time.time() - s["takenAt"]) / 60)
+    age = f"{mins}m" if mins < 60 else (f"{mins//60}h" if mins < 1440 else f"{mins//1440}d")
+    n_claude = sum(1 for t in s["tabs"] if t.get("claudeSession"))
+    cwds = ", ".join(sorted({os.path.basename(t["cwd"]) or "~" for t in s["tabs"]})[:4])
+    print(f"{f}\t{age:>4} ago  {len(s['tabs'])} tabs ({n_claude} claude)  {cwds}")
+PY
+) || true
+  [ -n "$chosen" ] || { echo "no snapshots in $SNAPSHOT_DIR" >&2; exit 1; }
+  chosen=$(echo "$chosen" | fzf --delimiter '\t' --with-nth 2.. --no-sort \
+    --header 'pick the terminal state to restore' | cut -f1)
+  [ -n "$chosen" ] && restore_crash "$chosen"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: claude-sessions                    interactive session picker (fzf)
+       claude-sessions --snapshot        snapshot iTerm tabs + claude sessions
+       claude-sessions --restore-crash [file]
+                                         restore newest (or given) snapshot
+       claude-sessions --restore-pick    choose a snapshot from history to restore
+       claude-sessions --list [all|main] print sessions (tab-separated)
+EOF
+  exit 2
+}
+
 # ---------------------------------------------------------------- main -----
 case "${1:-}" in
   --list)       list_sessions "${2:-all}" ;;
   --preview)    preview_session "$2" ;;
   --open-line)  open_line "$2" ;;
   --snapshot)      snapshot_state ;;
-  --restore-crash) restore_crash ;;
+  --restore-crash) restore_crash "${2:-}" ;;
+  --restore-pick)  pick_snapshot ;;
+  -h|--help)       usage ;;
+  ?*)              echo "claude-sessions: unknown argument: $1" >&2; usage ;;
   *)
     list_sessions | fzf --ansi --delimiter '\t' --with-nth 4.. \
       --no-sort --layout=reverse --info=inline \

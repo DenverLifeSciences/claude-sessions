@@ -49,7 +49,14 @@ after a reboot:
 ```sh
 claude-sessions --snapshot        # dump current iTerm state to ~/.claude/terminal-snapshot.json
 claude-sessions --restore-crash   # recreate every tab; rerun `claude --resume` where Claude was running
+claude-sessions --restore-pick    # browse snapshot history in fzf, restore any earlier state
 ```
+
+Snapshots are kept as history (last 100 distinct states, in
+`~/.claude/terminal-snapshots/`), so even if the timer runs after you reopen a
+near-empty terminal, the pre-crash layout is still there — `--restore-pick`
+shows each snapshot's age, tab count, and projects so you can grab the right
+one. Identical consecutive states aren't re-saved.
 
 Run the snapshot on a timer with launchd (every 5 min): copy
 [`contrib/com.claude.terminal-snapshot.plist`](contrib/com.claude.terminal-snapshot.plist)
