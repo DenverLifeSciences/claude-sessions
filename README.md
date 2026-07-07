@@ -19,12 +19,15 @@ Each line shows the session's age, project directory, git branch (when not main/
 
 Dependencies: `fzf` (`brew install fzf`) and `python3` (ships with macOS).
 
+One command — installs the script to `~/.local/bin`, adds it to your PATH with
+a `cs` alias, and loads the 5-minute snapshot timer (see below):
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/DenverLifeSciences/claude-sessions/main/claude-sessions -o /usr/local/bin/claude-sessions
-chmod +x /usr/local/bin/claude-sessions
+curl -fsSL https://raw.githubusercontent.com/DenverLifeSciences/claude-sessions/main/claude-sessions | bash -s -- --install
 ```
 
-Then run `claude-sessions` (alias it to `cs` if you like).
+Later, `claude-sessions --update` pulls the latest version. Both commands are
+idempotent — rerun them freely.
 
 ## How it works
 
@@ -58,15 +61,15 @@ near-empty terminal, the pre-crash layout is still there — `--restore-pick`
 shows each snapshot's age, tab count, and projects so you can grab the right
 one. Identical consecutive states aren't re-saved.
 
-Run the snapshot on a timer with launchd (every 5 min): copy
-[`contrib/com.claude.terminal-snapshot.plist`](contrib/com.claude.terminal-snapshot.plist)
-to `~/Library/LaunchAgents/`, fix the script path inside, then
-`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude.terminal-snapshot.plist`.
+`--install` sets up the 5-minute snapshot timer automatically (a launchd
+agent, `com.claude.terminal-snapshot`; template in
+[`contrib/`](contrib/com.claude.terminal-snapshot.plist) if you'd rather wire
+it yourself).
 
 Notes: an empty iTerm never overwrites the last good snapshot, so the
-pre-crash state survives the reboot. If the script lives in a cloud-synced
-folder (iCloud Drive, Dropbox), point the plist at a local copy — macOS
-denies launchd jobs access to cloud-provider paths.
+pre-crash state survives the reboot. The script installs to a local path
+(`~/.local/bin`) rather than anywhere cloud-synced because macOS denies
+launchd jobs access to cloud-provider paths (iCloud Drive, Dropbox).
 
 ## Caveats
 

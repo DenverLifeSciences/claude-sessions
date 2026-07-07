@@ -169,6 +169,66 @@ open_line() {  # $1 = file containing the highlighted tab-delimited line
 # post-reboot run never clobbers the last good snapshot.
 SNAPSHOT_FILE="${CLAUDE_SESSIONS_SNAPSHOT:-$HOME/.claude/terminal-snapshot.json}"
 SNAPSHOT_DIR="${CLAUDE_SESSIONS_SNAPSHOT_DIR:-$HOME/.claude/terminal-snapshots}"
+INSTALL_PATH="${CLAUDE_SESSIONS_INSTALL:-$HOME/.local/bin/claude-sessions}"
+RAW_URL="https://raw.githubusercontent.com/DenverLifeSciences/claude-sessions/main/claude-sessions"
+PLIST="$HOME/Library/LaunchAgents/com.claude.terminal-snapshot.plist"
+
+# --------------------------------------------------------- install/update --
+# GitHub is the single source of truth. --install fetches the latest script to
+# a LOCAL path (launchd cannot read iCloud/cloud-synced paths — macOS TCC),
+# wires up PATH + `cs` alias, and loads the snapshot timer. --update refreshes
+# the installed copy in place. Both are idempotent; rerun freely.
+self_install() {
+  command -v python3 >/dev/null || { echo "missing dependency: python3" >&2; exit 1; }
+  command -v fzf >/dev/null || echo "WARNING: fzf not found (brew install fzf) — picker won't work until installed" >&2
+  mkdir -p "$(dirname "$INSTALL_PATH")"
+  if curl -fsSL "$RAW_URL" -o "$INSTALL_PATH.tmp" 2>/dev/null; then
+    mv "$INSTALL_PATH.tmp" "$INSTALL_PATH"
+    echo "installed latest from GitHub -> $INSTALL_PATH"
+  elif [ -f "$SELF" ] && [ "$SELF" != "$INSTALL_PATH" ]; then
+    cp "$SELF" "$INSTALL_PATH"
+    echo "offline: copied $SELF -> $INSTALL_PATH"
+  else
+    echo "install failed: cannot reach GitHub and no local copy to fall back on" >&2; exit 1
+  fi
+  chmod +x "$INSTALL_PATH"
+
+  local zshrc="$HOME/.zshrc"
+  grep -qs '/.local/bin' "$zshrc" || printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$zshrc"
+  grep -qs 'alias cs=' "$zshrc" || printf "alias cs='claude-sessions'\n" >> "$zshrc"
+
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.claude.terminal-snapshot</string>
+  <key>ProgramArguments</key>
+  <array><string>$INSTALL_PATH</string><string>--snapshot</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/tmp/claude-terminal-snapshot.log</string>
+  <key>StandardErrorPath</key><string>/tmp/claude-terminal-snapshot.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/com.claude.terminal-snapshot" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  echo "snapshot timer loaded (every 5 min) -> $SNAPSHOT_DIR"
+  echo "done — open a new shell and run: cs"
+}
+
+self_update() {
+  local target="$INSTALL_PATH"
+  [ -f "$target" ] || target="$SELF"
+  curl -fsSL "$RAW_URL" -o "$target.tmp" || { echo "update failed: cannot reach GitHub" >&2; exit 1; }
+  if cmp -s "$target.tmp" "$target"; then
+    rm -f "$target.tmp"; echo "already up to date: $target"
+  else
+    mv "$target.tmp" "$target" && chmod +x "$target"
+    echo "updated $target"
+  fi
+}
 
 snapshot_state() {
   local dump
@@ -264,7 +324,6 @@ if history:
 data = {"takenAt": int(time.time()), "tabs": tabs}
 hist_path = os.path.join(snap_dir, f"{data['takenAt']}.json")
 json.dump(data, open(hist_path, "w"), indent=1)
-json.dump(data, open(out_path, "w"), indent=1)  # "latest" pointer
 for old in history[:-100]:  # keep last ~100 distinct states
     os.remove(old)
 print(f"snapshot: {len(tabs)} tab(s) -> {hist_path}")
@@ -334,6 +393,8 @@ usage: claude-sessions                    interactive session picker (fzf)
                                          restore newest (or given) snapshot
        claude-sessions --restore-pick    choose a snapshot from history to restore
        claude-sessions --list [all|main] print sessions (tab-separated)
+       claude-sessions --install         set up on this machine (script, PATH, cs alias, snapshot timer)
+       claude-sessions --update          refresh installed copy from GitHub
 EOF
   exit 2
 }
@@ -346,6 +407,8 @@ case "${1:-}" in
   --snapshot)      snapshot_state ;;
   --restore-crash) restore_crash "${2:-}" ;;
   --restore-pick)  pick_snapshot ;;
+  --install)       self_install ;;
+  --update)        self_update ;;
   -h|--help)       usage ;;
   ?*)              echo "claude-sessions: unknown argument: $1" >&2; usage ;;
   *)
