@@ -26,6 +26,10 @@ a `cs` alias, and loads the 5-minute snapshot timer (see below):
 curl -fsSL https://raw.githubusercontent.com/DenverLifeSciences/claude-sessions/main/claude-sessions | bash -s -- --install
 ```
 
+Then open a new shell and run **`cs`** — the short alias the installer adds —
+to launch the picker (`claude-sessions` works too; zsh only, bash/fish users
+add their own alias).
+
 Later, `claude-sessions --update` pulls the latest version. Both commands are
 idempotent — rerun them freely.
 
