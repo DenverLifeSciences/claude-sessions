@@ -286,18 +286,17 @@ snap = json.load(open(path))
 age_min = (time.time() - snap["takenAt"]) / 60
 print(f"restoring {len(snap['tabs'])} tab(s) from {path} (taken {age_min:.0f} min ago)")
 
-script = ['tell application "iTerm"', "activate"]
-last_win = None
+# All snapshot tabs are restored as tabs of the CURRENT window (the one the
+# command runs in), regardless of how they were grouped into windows before —
+# one window to rule them all, and the initiating tab is left untouched.
+script = ['tell application "iTerm"', "activate",
+          "if (count of windows) is 0 then create window with default profile"]
 for tab in snap["tabs"]:
     cmd = "cd " + shlex.quote(tab["cwd"])
     if tab.get("claudeSession"):
         cmd += f" && {claude_bin} --resume {tab['claudeSession']}"
     esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
-    if tab["window"] != last_win:
-        script.append("create window with default profile")
-        last_win = tab["window"]
-    else:
-        script.append("tell current window to create tab with default profile")
+    script.append("tell current window to create tab with default profile")
     script.append(f'tell current session of current window to write text "{esc}"')
 script.append("end tell")
 subprocess.run(["osascript", "-e", "\n".join(script)], check=True)

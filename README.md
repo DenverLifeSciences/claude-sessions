@@ -48,7 +48,7 @@ after a reboot:
 
 ```sh
 claude-sessions --snapshot        # dump current iTerm state to ~/.claude/terminal-snapshot.json
-claude-sessions --restore-crash   # recreate every tab; rerun `claude --resume` where Claude was running
+claude-sessions --restore-crash   # recreate every tab (as tabs of the current window); rerun `claude --resume` where Claude was running
 claude-sessions --restore-pick    # browse snapshot history in fzf, restore any earlier state
 ```
 
