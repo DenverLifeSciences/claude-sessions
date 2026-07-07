@@ -11,7 +11,9 @@
 # Keys: enter=open  ctrl-r=refresh  esc=quit
 set -euo pipefail
 
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# BASH_SOURCE is unset when piped (curl ... | bash -s -- --install)
+SELF="${BASH_SOURCE[0]:-$0}"
+[ -f "$SELF" ] && SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo claude)}"
 MAX_SESSIONS="${CLAUDE_SESSIONS_MAX:-300}"
 
