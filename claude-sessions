@@ -162,11 +162,137 @@ open_line() {  # $1 = file containing the highlighted tab-delimited line
   [ -n "$id" ] && open_one "$id" "$cwd"
 }
 
+# ------------------------------------------------------------ snapshot -----
+# Dumps every iTerm tab (cwd + running claude session id, if any) to
+# $SNAPSHOT_FILE. Run periodically (launchd) so a machine crash can be
+# undone with --restore-crash. Skips writing when iTerm has no tabs, so a
+# post-reboot run never clobbers the last good snapshot.
+SNAPSHOT_FILE="${CLAUDE_SESSIONS_SNAPSHOT:-$HOME/.claude/terminal-snapshot.json}"
+
+snapshot_state() {
+  local dump
+  dump=$(osascript <<'EOF' 2>/dev/null
+set out to ""
+tell application "iTerm"
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        set out to out & (id of w) & "|" & (tty of s) & linefeed
+      end repeat
+    end repeat
+  end repeat
+end tell
+return out
+EOF
+) || true
+  SNAP_DUMP="$dump" python3 - "$SNAPSHOT_FILE" <<'PY'
+import json, os, re, subprocess, sys, time
+
+out_path = sys.argv[1]
+tabs = []
+for line in os.environ.get("SNAP_DUMP", "").splitlines():
+    if "|" not in line: continue
+    win, tty = line.split("|", 1)
+    tty = tty.strip().replace("/dev/", "")
+    if not tty: continue
+    try:
+        ps = subprocess.run(["ps", "-t", tty, "-o", "pid=,command="],
+                            capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        continue
+    shell_pid = claude_pid = None
+    resume_id = None
+    for pline in ps.splitlines():
+        parts = pline.strip().split(None, 1)
+        if len(parts) != 2: continue
+        pid, cmd = parts
+        if shell_pid is None and re.search(r"(^|/)-?(zsh|bash|fish)", cmd):
+            shell_pid = pid
+        if claude_pid is None and re.search(r"(^|/)claude( |$)", cmd):
+            claude_pid = pid
+            m = re.search(r"--resume[= ]([0-9a-f-]{36})", cmd)
+            if m: resume_id = m.group(1)
+
+    def cwd_of(pid):
+        try:
+            out = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for l in out.splitlines():
+                if l.startswith("n"): return l[1:]
+        except Exception:
+            pass
+        return None
+
+    cwd = cwd_of(claude_pid or shell_pid) if (claude_pid or shell_pid) else None
+    if not cwd: continue
+
+    sid = resume_id
+    if claude_pid and not sid:
+        # exact match: the transcript claude holds open
+        try:
+            out = subprocess.run(["lsof", "-p", claude_pid, "-Fn"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            m = re.search(r"\.claude/projects/[^\n]*/([0-9a-f-]{36})\.jsonl", out)
+            if m: sid = m.group(1)
+        except Exception:
+            pass
+    if claude_pid and not sid:
+        # fallback: newest transcript for this cwd's project dir
+        proj = os.path.expanduser("~/.claude/projects/") + re.sub(r"[/.]", "-", cwd)
+        try:
+            js = [os.path.join(proj, f) for f in os.listdir(proj) if f.endswith(".jsonl")]
+            if js: sid = os.path.basename(max(js, key=os.path.getmtime))[:-6]
+        except OSError:
+            pass
+    tabs.append({"window": win.strip(), "cwd": cwd, "claudeSession": sid})
+
+if tabs:  # never overwrite a good snapshot with an empty one
+    json.dump({"takenAt": int(time.time()), "tabs": tabs}, open(out_path, "w"), indent=1)
+    print(f"snapshot: {len(tabs)} tab(s) -> {out_path}")
+else:
+    print("snapshot: no iTerm tabs found; keeping previous snapshot")
+PY
+}
+
+restore_crash() {
+  python3 - "$SNAPSHOT_FILE" "$CLAUDE_BIN" <<'PY'
+import json, os, shlex, subprocess, sys, time
+
+path, claude_bin = sys.argv[1], sys.argv[2]
+if not os.path.exists(path):
+    sys.exit("no snapshot found at " + path)
+snap = json.load(open(path))
+age_min = (time.time() - snap["takenAt"]) / 60
+print(f"restoring {len(snap['tabs'])} tab(s) from snapshot taken {age_min:.0f} min ago")
+
+script = ['tell application "iTerm"', "activate"]
+last_win = None
+for tab in snap["tabs"]:
+    cmd = "cd " + shlex.quote(tab["cwd"])
+    if tab.get("claudeSession"):
+        cmd += f" && {claude_bin} --resume {tab['claudeSession']}"
+    esc = cmd.replace("\\", "\\\\").replace('"', '\\"')
+    if tab["window"] != last_win:
+        script.append("create window with default profile")
+        last_win = tab["window"]
+    else:
+        script.append("tell current window to create tab with default profile")
+    script.append(f'tell current session of current window to write text "{esc}"')
+script.append("end tell")
+subprocess.run(["osascript", "-e", "\n".join(script)], check=True)
+for tab in snap["tabs"]:
+    mark = "claude --resume " + tab["claudeSession"] if tab.get("claudeSession") else "shell"
+    print(f"  {tab['cwd']}  [{mark}]")
+PY
+}
+
 # ---------------------------------------------------------------- main -----
 case "${1:-}" in
   --list)       list_sessions "${2:-all}" ;;
   --preview)    preview_session "$2" ;;
   --open-line)  open_line "$2" ;;
+  --snapshot)      snapshot_state ;;
+  --restore-crash) restore_crash ;;
   *)
     list_sessions | fzf --ansi --delimiter '\t' --with-nth 4.. \
       --no-sort --layout=reverse --info=inline \

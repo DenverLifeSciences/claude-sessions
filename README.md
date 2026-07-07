@@ -38,6 +38,29 @@ The early lines of each file carry `sessionId`, `cwd`, `gitBranch`, the first us
 
 Task-tool subagent transcripts live in a `<session-id>/subagents/` subdirectory and are never listed. Teammate sessions (agent teams) are tagged with a magenta `⛭ <agent-name>` and can be toggled off with `ctrl-a`.
 
+
+## Crash recovery: snapshot & restore the whole terminal
+
+A machine crash kills every tab, not just Claude. `claude-sessions` can
+snapshot your full iTerm layout — every window/tab, its working directory,
+and the Claude session running inside it (if any) — and rebuild it all
+after a reboot:
+
+```sh
+claude-sessions --snapshot        # dump current iTerm state to ~/.claude/terminal-snapshot.json
+claude-sessions --restore-crash   # recreate every tab; rerun `claude --resume` where Claude was running
+```
+
+Run the snapshot on a timer with launchd (every 5 min): copy
+[`contrib/com.claude.terminal-snapshot.plist`](contrib/com.claude.terminal-snapshot.plist)
+to `~/Library/LaunchAgents/`, fix the script path inside, then
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude.terminal-snapshot.plist`.
+
+Notes: an empty iTerm never overwrites the last good snapshot, so the
+pre-crash state survives the reboot. If the script lives in a cloud-synced
+folder (iCloud Drive, Dropbox), point the plist at a local copy — macOS
+denies launchd jobs access to cloud-provider paths.
+
 ## Caveats
 
 - The `~/.claude/projects` layout is undocumented internal storage — a Claude Code update could change it. The script only reads these files; worst case the picker breaks, never your sessions.
