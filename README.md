@@ -50,7 +50,7 @@ and the Claude session running inside it (if any) — and rebuild it all
 after a reboot:
 
 ```sh
-claude-sessions --snapshot        # dump current iTerm state to ~/.claude/terminal-snapshot.json
+claude-sessions --snapshot        # snapshot iTerm state now (the timer does this every 5 min)
 claude-sessions --restore-crash   # recreate every tab (as tabs of the current window); rerun `claude --resume` where Claude was running
 claude-sessions --restore-pick    # browse snapshot history in fzf, restore any earlier state
 ```
