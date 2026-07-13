@@ -1,26 +1,29 @@
 # claude-sessions
 
-A cross-project session picker for [Claude Code](https://claude.com/claude-code) CLI.
+Find and resume any Claude Code session from any project — and rebuild your whole
+terminal after a reboot — from one [fzf](https://github.com/junegunn/fzf) picker.
 
-Your machine crashes with seven Claude Code sessions open across five repos. `claude --resume` only lists sessions for the directory you run it from — so recovery means remembering every repo you were in, `cd`-ing into each one, and picking from a list, seven times.
+**What it does**
 
-`claude-sessions` instead lists **every session from every project** in one [fzf](https://github.com/junegunn/fzf) picker, newest first. Hit Enter and the session opens in a new iTerm tab (or tmux window) running `claude --resume <id>` in the right directory — while the picker stays open for the next one.
+- **Cross-project picker.** `claude --resume` only lists sessions for the directory
+  you run it from. `claude-sessions` lists *every* session from *every* project in
+  one picker, newest first. Enter opens the highlighted session in a new iTerm tab
+  (or tmux window) running `claude --resume <id>` in the right directory — and the
+  picker stays open for the next one.
+- **Crash recovery.** A timer snapshots your full iTerm layout every 5 minutes —
+  every window/tab, its working directory, and the Claude session running inside it.
+  After a reboot (or an unattended OS update), one command rebuilds the whole set.
 
-```
-enter   open session in a new tab (picker stays open)
-ctrl-a  hide/show agent-teammate sessions (⛭)
-ctrl-r  refresh the list
-esc     quit
-```
-
-Each line shows the session's age, project directory, git branch (when not main/master), and its opening message. A preview pane shows the last few user/assistant exchanges of the highlighted session. Resume runs interactively in the new tab, so Claude Code's own "resume from summary or full session?" prompt appears there.
+**Why.** Recovering by hand means remembering every repo you had open, `cd`-ing into
+each, and running `claude --resume` there — once per session. This collapses that
+into: run `cs`, skim, hit Enter. And a reboot no longer costs you your working set.
 
 ## Install
 
 Dependencies: `fzf` (`brew install fzf`) and `python3` (ships with macOS).
 
 One command — installs the script to `~/.local/bin`, adds it to your PATH with
-a `cs` alias, and loads the 5-minute snapshot timer (see below):
+a `cs` alias, and loads the 5-minute snapshot timer:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/DenverLifeSciences/claude-sessions/main/claude-sessions | bash -s -- --install
@@ -33,6 +36,21 @@ add their own alias).
 Later, `claude-sessions --update` pulls the latest version. Both commands are
 idempotent — rerun them freely.
 
+## Keys
+
+```
+enter   open session in a new tab (picker stays open)
+ctrl-a  hide/show agent-teammate sessions (⛭)
+ctrl-r  refresh the list
+esc     quit
+```
+
+Each line shows the session's age, project directory, git branch (when not
+main/master), and its opening message. A preview pane shows the last few
+user/assistant exchanges of the highlighted session. Resume runs interactively in
+the new tab, so Claude Code's own "resume from summary or full session?" prompt
+appears there.
+
 ## How it works
 
 Claude Code stores every session as a JSONL transcript:
@@ -44,7 +62,6 @@ Claude Code stores every session as a JSONL transcript:
 The early lines of each file carry `sessionId`, `cwd`, `gitBranch`, the first user message, and — for sessions spawned as agent teammates — an `agentName` field. That's a complete session index sitting on disk; this script just points fzf at it.
 
 Task-tool subagent transcripts live in a `<session-id>/subagents/` subdirectory and are never listed. Teammate sessions (agent teams) are tagged with a magenta `⛭ <agent-name>` and can be toggled off with `ctrl-a`.
-
 
 ## Crash recovery: snapshot & restore the whole terminal
 
@@ -61,9 +78,12 @@ claude-sessions --restore-pick    # browse snapshot history in fzf, restore any 
 
 Snapshots are kept as history (last 100 distinct states, in
 `~/.claude/terminal-snapshots/`), so even if the timer runs after you reopen a
-near-empty terminal, the pre-crash layout is still there — `--restore-pick`
-shows each snapshot's age, tab count, and projects so you can grab the right
-one. Identical consecutive states aren't re-saved.
+near-empty terminal, the pre-crash layout is still there. `--restore-crash`
+defaults to the newest snapshot that still has live Claude sessions — a reboot
+leaves iTerm's bare shells behind, and that session-less husk is skipped rather
+than restored over your real state. `--restore-pick` shows each snapshot's age,
+tab count, and projects so you can grab any earlier one by hand. Identical
+consecutive states aren't re-saved.
 
 `--install` sets up the 5-minute snapshot timer automatically (a launchd
 agent, `com.claude.terminal-snapshot`; template in

@@ -337,10 +337,32 @@ restore_crash() {  # $1 (optional) = specific snapshot file; default: newest
 import glob, json, os, shlex, subprocess, sys, time
 
 arg, latest, snap_dir, claude_bin = sys.argv[1:5]
+
+def n_sessions(p):  # live claude sessions recorded in a snapshot file
+    try:
+        return sum(1 for t in json.load(open(p)).get("tabs", []) if t.get("claudeSession"))
+    except Exception:
+        return 0
+
 path = arg
 if not path:
-    history = sorted(glob.glob(os.path.join(snap_dir, "*.json")))
-    path = history[-1] if history else latest
+    # Default: newest snapshot that actually has live claude sessions. A reboot
+    # (or sleep/crash) kills every claude process but iTerm restores the bare
+    # shells, so the first post-reboot snapshot has tabs but 0 sessions — a husk.
+    # Skip those so `--restore-crash` never lands on a session-less state.
+    history = sorted(glob.glob(os.path.join(snap_dir, "*.json")))  # oldest -> newest
+    healthy = [p for p in history if n_sessions(p) > 0]
+    if healthy:
+        path = healthy[-1]
+        skipped = len(history) - 1 - history.index(path)
+        if skipped:
+            print(f"skipped {skipped} newer session-less snapshot(s) (likely post-reboot "
+                  f"shells); restoring newest snapshot with live sessions")
+    elif history:
+        path = history[-1]
+        print("warning: no snapshot has live claude sessions; restoring newest anyway")
+    else:
+        path = latest
 if not path or not os.path.exists(path):
     sys.exit("no snapshot found (looked in %s and %s)" % (snap_dir, latest))
 snap = json.load(open(path))
