@@ -174,6 +174,8 @@ SNAPSHOT_DIR="${CLAUDE_SESSIONS_SNAPSHOT_DIR:-$HOME/.claude/terminal-snapshots}"
 INSTALL_PATH="${CLAUDE_SESSIONS_INSTALL:-$HOME/.local/bin/claude-sessions}"
 RAW_URL="https://raw.githubusercontent.com/DenverLifeSciences/claude-sessions/main/claude-sessions"
 PLIST="$HOME/Library/LaunchAgents/com.claude.terminal-snapshot.plist"
+UPDATE_CACHE="${CLAUDE_SESSIONS_UPDATE_CACHE:-$HOME/.claude/.claude-sessions-update}"
+UPDATE_TTL="${CLAUDE_SESSIONS_UPDATE_TTL:-86400}"  # re-check GitHub at most once/day
 
 # --------------------------------------------------------- install/update --
 # GitHub is the single source of truth. --install fetches the latest script to
@@ -230,6 +232,36 @@ self_update() {
     mv "$target.tmp" "$target" && chmod +x "$target"
     echo "updated $target"
   fi
+}
+
+# ------------------------------------------------------- update notifier ---
+# The picker nags (once) when a newer version is on GitHub, WITHOUT ever
+# blocking on the network: update_check_bg refreshes a cached flag in the
+# background (throttled to UPDATE_TTL), update_notice reads that cache and
+# prints instantly. So the notice reflects the *previous* run's check — which
+# is exactly right for an update reminder. Cache line: "<checked-epoch> <0|1>".
+update_check_bg() {
+  [ -t 2 ] || return 0  # only from an interactive terminal, never launchd
+  local now checked=0
+  now=$(date +%s)
+  [ -f "$UPDATE_CACHE" ] && read -r checked _ < "$UPDATE_CACHE" 2>/dev/null || true
+  case "$checked" in ''|*[!0-9]*) checked=0 ;; esac
+  [ $(( now - checked )) -ge "$UPDATE_TTL" ] || return 0  # checked recently
+  ( target="$INSTALL_PATH"; [ -f "$target" ] || target="$SELF"
+    tmp="$(mktemp)" || exit 0
+    if curl -fsSL --max-time 5 "$RAW_URL" -o "$tmp" 2>/dev/null; then
+      a=0; cmp -s "$tmp" "$target" || a=1
+      printf '%s %s\n' "$(date +%s)" "$a" > "$UPDATE_CACHE"
+    fi
+    rm -f "$tmp" ) >/dev/null 2>&1 &
+}
+
+update_notice() {
+  [ -t 2 ] || return 0
+  local avail=0
+  [ -f "$UPDATE_CACHE" ] && read -r _ avail < "$UPDATE_CACHE" 2>/dev/null || true
+  [ "$avail" = "1" ] && printf '\033[33m▲ claude-sessions: a newer version is on GitHub — run `claude-sessions --update`\033[0m\n' >&2
+  return 0
 }
 
 snapshot_state() {
@@ -486,6 +518,7 @@ case "${1:-}" in
   -h|--help)       usage ;;
   ?*)              echo "claude-sessions: unknown argument: $1" >&2; usage ;;
   *)
+    update_check_bg
     list_sessions | fzf --ansi --delimiter '\t' --with-nth 4.. \
       --no-sort --layout=reverse --info=inline \
       --header 'enter: open in new tab (picker stays)  |  ctrl-a: hide/show ⛭ agents  |  ctrl-r: refresh  |  esc: quit' \
@@ -496,5 +529,6 @@ case "${1:-}" in
         && echo \"change-prompt(> )+reload('$SELF' --list all)\" \
         || echo \"change-prompt(main> )+reload('$SELF' --list main)\"" \
       >/dev/null || true
+    update_notice
     ;;
 esac
