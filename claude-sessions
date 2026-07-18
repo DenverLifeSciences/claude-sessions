@@ -252,6 +252,28 @@ EOF
 import glob, json, os, re, subprocess, sys, time
 
 out_path, snap_dir = sys.argv[1], sys.argv[2]
+
+def is_teammate(sid):
+    # A TeamCreate teammate's transcript carries an `agentName` field; the
+    # session you drove (or a solo session) has none, and the team lead is
+    # "team-lead" — both count as yours. iTerm's tmux control-mode integration
+    # surfaces each teammate pane as a native session, so the snapshot walk sees
+    # them; skip so --restore-crash never resurrects a subagent window.
+    if not sid: return False
+    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/" + sid + ".jsonl")):
+        try:
+            with open(f, errors="replace") as fh:
+                for i, line in enumerate(fh):
+                    if i > 60: break
+                    try: e = json.loads(line)
+                    except Exception: continue
+                    if "agentName" in e:
+                        a = e.get("agentName") or ""
+                        return bool(a) and a != "team-lead"
+        except OSError:
+            pass
+    return False
+
 tabs = []
 for line in os.environ.get("SNAP_DUMP", "").splitlines():
     if "|" not in line: continue
@@ -307,6 +329,8 @@ for line in os.environ.get("SNAP_DUMP", "").splitlines():
             if js: sid = os.path.basename(max(js, key=os.path.getmtime))[:-6]
         except OSError:
             pass
+    if is_teammate(sid):  # subagent/teammate window — not one of the user's
+        continue
     tabs.append({"window": win.strip(), "cwd": cwd, "claudeSession": sid})
 
 if not tabs:  # never overwrite a good snapshot with an empty one
@@ -338,9 +362,29 @@ import glob, json, os, shlex, subprocess, sys, time
 
 arg, latest, snap_dir, claude_bin = sys.argv[1:5]
 
-def n_sessions(p):  # live claude sessions recorded in a snapshot file
+def is_teammate(sid):
+    # See snapshot_state: teammate transcripts carry a non-"team-lead" agentName.
+    # Applied here too so OLD snapshots (taken before snapshot-time filtering)
+    # don't resurrect subagent windows.
+    if not sid: return False
+    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/" + sid + ".jsonl")):
+        try:
+            with open(f, errors="replace") as fh:
+                for i, line in enumerate(fh):
+                    if i > 60: break
+                    try: e = json.loads(line)
+                    except Exception: continue
+                    if "agentName" in e:
+                        a = e.get("agentName") or ""
+                        return bool(a) and a != "team-lead"
+        except OSError:
+            pass
+    return False
+
+def n_sessions(p):  # the user's own live claude sessions in a snapshot file
     try:
-        return sum(1 for t in json.load(open(p)).get("tabs", []) if t.get("claudeSession"))
+        return sum(1 for t in json.load(open(p)).get("tabs", [])
+                   if t.get("claudeSession") and not is_teammate(t["claudeSession"]))
     except Exception:
         return 0
 
@@ -367,6 +411,12 @@ if not path or not os.path.exists(path):
     sys.exit("no snapshot found (looked in %s and %s)" % (snap_dir, latest))
 snap = json.load(open(path))
 age_min = (time.time() - snap["takenAt"]) / 60
+all_tabs = snap["tabs"]
+tabs = [t for t in all_tabs if not is_teammate(t.get("claudeSession"))]
+skipped_agents = len(all_tabs) - len(tabs)
+snap["tabs"] = tabs
+if skipped_agents:
+    print(f"skipped {skipped_agents} subagent/teammate window(s)")
 print(f"restoring {len(snap['tabs'])} tab(s) from {path} (taken {age_min:.0f} min ago)")
 
 # All snapshot tabs are restored as tabs of the CURRENT window (the one the
