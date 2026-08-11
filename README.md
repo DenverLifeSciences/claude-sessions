@@ -45,8 +45,9 @@ ctrl-r  refresh the list
 esc     quit
 ```
 
-Each line shows the session's age, project directory, git branch (when not
-main/master), and its opening message. A preview pane shows the last few
+Each line shows the session's age, project directory, account (only when it
+isn't the default one), git branch (when not main/master), and its opening
+message. A preview pane shows the last few
 user/assistant exchanges of the highlighted session. Resume runs interactively in
 the new tab, so Claude Code's own "resume from summary or full session?" prompt
 appears there.
@@ -62,6 +63,26 @@ Claude Code stores every session as a JSONL transcript:
 The early lines of each file carry `sessionId`, `cwd`, `gitBranch`, the first user message, and — for sessions spawned as agent teammates — an `agentName` field. That's a complete session index sitting on disk; this script just points fzf at it.
 
 Task-tool subagent transcripts live in a `<session-id>/subagents/` subdirectory and are never listed. Teammate sessions (agent teams) are tagged with a magenta `⛭ <agent-name>` and can be toggled off with `ctrl-a`.
+
+### Two accounts
+
+`CLAUDE_CONFIG_DIR` lets you run a second Claude account with its own tree of
+transcripts, and a picker that reads only `~/.claude` can't see any of it — the
+session is simply absent from the list, with nothing to select. So the picker
+scans every config dir in `CS_CONFIG_DIRS` (`:`-separated, default
+`~/.claude:~/.claude-personal`) and labels sessions from a non-default account
+with a blue `▸<name>`. Missing dirs are skipped, so the default is fine on a
+one-account machine. Set `CLAUDE_SESSIONS_CONFIG_DIRS` to scan a different set:
+
+```sh
+export CLAUDE_SESSIONS_CONFIG_DIRS="$HOME/.claude:$HOME/.claude-work"
+```
+
+Resuming across accounts is Claude Code's business, not the picker's: it runs
+`claude --resume <id>`, so if your `claude` is a shim that points
+`CLAUDE_CONFIG_DIR` at whichever tree owns the id, cross-account resume works
+as-is. Otherwise, launch the picker from a shell where `CLAUDE_CONFIG_DIR` is
+already set for the account you want to resume into.
 
 ## Crash recovery: snapshot & restore the whole terminal
 
@@ -99,7 +120,7 @@ launchd jobs access to cloud-provider paths (iCloud Drive, Dropbox).
 
 - The `~/.claude/projects` layout is undocumented internal storage — a Claude Code update could change it. The script only reads these files; worst case the picker breaks, never your sessions.
 - Opening tabs uses AppleScript (iTerm2, Terminal.app fallback), so that path is macOS-only. Inside tmux it uses `tmux new-window`, which works on Linux too.
-- Lists the 300 most recent sessions by default (`CLAUDE_SESSIONS_MAX` overrides).
+- Lists the 300 most recent sessions by default (`CLAUDE_SESSIONS_MAX` overrides). Scanning a second account pushes more sessions into that budget, so raise it if older ones start dropping off.
 
 ## License
 

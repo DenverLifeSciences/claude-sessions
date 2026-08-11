@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # claude-sessions — cross-project Claude Code session picker.
 #
-# Lists every session under ~/.claude/projects (all directories, newest first)
+# Lists every session under <config-dir>/projects, for each Claude config dir
+# in CS_CONFIG_DIRS (all projects, newest first)
 # in fzf. Enter opens the highlighted session in its own window running
 # `claude --resume <id>` interactively (so its summary-vs-full prompt appears
 # there), while the picker stays open for the next one:
@@ -16,6 +17,13 @@ SELF="${BASH_SOURCE[0]:-$0}"
 [ -f "$SELF" ] && SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo claude)}"
 MAX_SESSIONS="${CLAUDE_SESSIONS_MAX:-300}"
+# ":"-separated Claude config dirs to scan; transcripts live in <dir>/projects.
+# Anyone running two accounts side by side has a second tree (CLAUDE_CONFIG_DIR
+# elsewhere), and its sessions are invisible to a picker that only reads
+# ~/.claude. Missing dirs are skipped, so the default is safe on a one-account
+# machine. Listed explicitly rather than globbed as ~/.claude*: a stale copy
+# such as ~/.claude-backup would otherwise flood the picker with dead sessions.
+export CS_CONFIG_DIRS="${CLAUDE_SESSIONS_CONFIG_DIRS:-$HOME/.claude:$HOME/.claude-personal}"
 
 # ---------------------------------------------------------------- list -----
 # Emits tab-separated lines: session_id <TAB> cwd <TAB> jsonl_path <TAB> display
@@ -26,12 +34,21 @@ import glob, json, os, re, signal, sys, time
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 max_n, mode = int(sys.argv[1]), sys.argv[2]
-root = os.path.expanduser("~/.claude/projects")
-files = [f for f in glob.glob(os.path.join(root, "*", "*.jsonl"))
+roots = [d for d in os.environ.get("CS_CONFIG_DIRS", "").split(":") if d]
+files = [f for r in roots
+         for f in glob.glob(os.path.join(r, "projects", "*", "*.jsonl"))
          if not os.path.basename(f).startswith("agent-")]
 files.sort(key=os.path.getmtime, reverse=True)
 
-DIM, CYAN, YELLOW, MAGENTA, RESET = "\033[2m", "\033[36m", "\033[33m", "\033[35m", "\033[0m"
+DIM, CYAN, YELLOW, MAGENTA, BLUE, RESET = ("\033[2m", "\033[36m", "\033[33m",
+                                           "\033[35m", "\033[34m", "\033[0m")
+
+def account_of(path):  # "" for the default ~/.claude, else e.g. "personal"
+    for r in roots:
+        if path.startswith(r.rstrip("/") + "/"):
+            name = os.path.basename(r.rstrip("/"))
+            return "" if name == ".claude" else name.replace(".claude-", "")
+    return ""
 
 def age(ts):
     s = int(time.time() - ts)
@@ -87,8 +104,10 @@ for f in files:
     if len(proj) > 34: proj = "…" + proj[-33:]
     br = f" {YELLOW}{branch[:14]}{RESET}" if branch and branch not in ("main", "master", "HEAD") else ""
     tag = f" {MAGENTA}⛭ {agent[:18]}{RESET}" if is_agent else ""
+    acct = account_of(f)  # only non-default accounts are labelled
+    acct = f" {BLUE}▸{acct[:10]}{RESET}" if acct else ""
     display = (f"{DIM}{age(os.path.getmtime(f)):>3}{RESET} "
-               f"{CYAN}{proj:<34}{RESET}{tag}{br} {title}")
+               f"{CYAN}{proj:<34}{RESET}{acct}{tag}{br} {title}")
     print(f"{sid}\t{cwd}\t{f}\t{display}")
     shown += 1
 PY
@@ -292,7 +311,9 @@ def is_teammate(sid):
     # surfaces each teammate pane as a native session, so the snapshot walk sees
     # them; skip so --restore-crash never resurrects a subagent window.
     if not sid: return False
-    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/" + sid + ".jsonl")):
+    pats = [os.path.join(d, "projects", "*", sid + ".jsonl")
+            for d in os.environ.get("CS_CONFIG_DIRS", "").split(":") if d]
+    for f in [p for pat in pats for p in glob.glob(pat)]:
         try:
             with open(f, errors="replace") as fh:
                 for i, line in enumerate(fh):
@@ -349,18 +370,22 @@ for line in os.environ.get("SNAP_DUMP", "").splitlines():
         try:
             out = subprocess.run(["lsof", "-p", claude_pid, "-Fn"],
                                  capture_output=True, text=True, timeout=10).stdout
-            m = re.search(r"\.claude/projects/[^\n]*/([0-9a-f-]{36})\.jsonl", out)
+            m = re.search(r"\.claude[^/]*/projects/[^\n]*/([0-9a-f-]{36})\.jsonl", out)
             if m: sid = m.group(1)
         except Exception:
             pass
     if claude_pid and not sid:
         # fallback: newest transcript for this cwd's project dir
-        proj = os.path.expanduser("~/.claude/projects/") + re.sub(r"[/.]", "-", cwd)
-        try:
-            js = [os.path.join(proj, f) for f in os.listdir(proj) if f.endswith(".jsonl")]
-            if js: sid = os.path.basename(max(js, key=os.path.getmtime))[:-6]
-        except OSError:
-            pass
+        slug = re.sub(r"[/.]", "-", cwd)
+        js = []
+        for d in os.environ.get("CS_CONFIG_DIRS", "").split(":"):
+            if not d: continue
+            proj = os.path.join(d, "projects", slug)
+            try:
+                js += [os.path.join(proj, f) for f in os.listdir(proj) if f.endswith(".jsonl")]
+            except OSError:
+                pass
+        if js: sid = os.path.basename(max(js, key=os.path.getmtime))[:-6]
     if is_teammate(sid):  # subagent/teammate window — not one of the user's
         continue
     tabs.append({"window": win.strip(), "cwd": cwd, "claudeSession": sid})
@@ -399,7 +424,9 @@ def is_teammate(sid):
     # Applied here too so OLD snapshots (taken before snapshot-time filtering)
     # don't resurrect subagent windows.
     if not sid: return False
-    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/" + sid + ".jsonl")):
+    pats = [os.path.join(d, "projects", "*", sid + ".jsonl")
+            for d in os.environ.get("CS_CONFIG_DIRS", "").split(":") if d]
+    for f in [p for pat in pats for p in glob.glob(pat)]:
         try:
             with open(f, errors="replace") as fh:
                 for i, line in enumerate(fh):
