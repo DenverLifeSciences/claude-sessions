@@ -9,7 +9,7 @@
 #   - inside tmux  -> new tmux window
 #   - otherwise    -> new TAB in the current iTerm window (Terminal.app fallback)
 #
-# Keys: enter=open  ctrl-r=refresh  esc=quit
+# Keys: enter=open  ctrl-a=hide agents  ctrl-s=full-text search  ctrl-r=refresh/back  esc=quit
 set -euo pipefail
 
 # BASH_SOURCE is unset when piped (curl ... | bash -s -- --install)
@@ -27,7 +27,7 @@ export CS_CONFIG_DIRS="${CLAUDE_SESSIONS_CONFIG_DIRS:-$HOME/.claude:$HOME/.claud
 
 # ---------------------------------------------------------------- list -----
 # Emits tab-separated lines: session_id <TAB> cwd <TAB> jsonl_path <TAB> display
-# $1 = "all" (default) or "main" (hide teammate/agent sessions)
+# $1 = "all" (default) or "main" (hide teammate/agent sessions and headless `claude -p` runs)
 list_sessions() {
   python3 - "$MAX_SESSIONS" "${1:-all}" <<'PY'
 import glob, json, os, re, signal, sys, time
@@ -38,6 +38,11 @@ roots = [d for d in os.environ.get("CS_CONFIG_DIRS", "").split(":") if d]
 files = [f for r in roots
          for f in glob.glob(os.path.join(r, "projects", "*", "*.jsonl"))
          if not os.path.basename(f).startswith("agent-")]
+only = os.environ.get("CS_ONLY_FILES")  # full-text search: restrict to these paths
+if only:
+    with open(only) as fh:
+        keep = {l.rstrip("\n") for l in fh}
+    files = [f for f in files if f in keep and "/subagents/" not in f]
 files.sort(key=os.path.getmtime, reverse=True)
 
 DIM, CYAN, YELLOW, MAGENTA, BLUE, RESET = ("\033[2m", "\033[36m", "\033[33m",
@@ -56,24 +61,96 @@ def age(ts):
     if s < 86400: return f"{s // 3600}h"
     return f"{s // 86400}d"
 
-def first_text(content):
-    if isinstance(content, str): return content
+def text_parts(content):
+    if isinstance(content, str): return [content]
     if isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                return part.get("text", "")
+        return [p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"]
+    return []
+
+# Wrappers Claude Code injects around user-role messages; none is something the
+# user typed. Blocks are dropped whole; <pasted_content> is unwrapped (its text
+# IS the prompt).
+INJECTED = re.compile(
+    r"<(local-command-caveat|local-command-stdout|local-command-stderr|"
+    r"bash-input|bash-stdout|bash-stderr|system-reminder|command-message)\b[^>]*>"
+    r".*?(</\1>|$)", re.S)
+PASTED = re.compile(r"</?pasted_content\b[^>]*>")
+CMD_NAME = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+CMD_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+# Built-in slash commands that are session plumbing, not a topic.
+NOISE_CMDS = {"/clear", "/model", "/effort", "/compact", "/config", "/help",
+              "/resume", "/exit", "/status", "/cost", "/context", "/rename",
+              "/login", "/logout", "/mcp", "/permissions", "/fast", "/theme",
+              "/vim", "/ide", "/usage", "/doctor", "/memory", "/agents", "/hooks"}
+SKIP_PREFIXES = ("This session is being continued", "Caveat:",
+                 "[Request interrupted", "Base directory for this skill")
+
+def typed_prompt(e):
+    """What the user actually typed in this user-role entry, or ''."""
+    if e.get("isMeta"): return ""
+    for t in text_parts(e.get("message", {}).get("content", "")):
+        m = CMD_NAME.search(t)
+        if m:
+            name = m.group(1).strip()
+            a = CMD_ARGS.search(t)
+            args = a.group(1).strip() if a else ""
+            if name in NOISE_CMDS and not args: continue
+            return f"{name} {args}".strip()
+        t = PASTED.sub("", INJECTED.sub("", t)).strip()
+        if t and not t.startswith(SKIP_PREFIXES) and not t.startswith("<"):
+            return t
     return ""
 
+def wrapped_text(e):  # fallback: e.g. teammate prompts wrapped in injected <tags>
+    for t in text_parts(e.get("message", {}).get("content", "")):
+        t = INJECTED.sub("", t)
+        t = re.sub(r"<[^>]*>", " ", t).strip()
+        if t and not t.startswith(SKIP_PREFIXES): return t
+    return ""
+
+TITLE_KEYS = (("custom-title", "customTitle"), ("ai-title", "aiTitle"))
+
+def scan_title(line, found):  # keep the LAST title entry seen, per kind
+    for kind, key in TITLE_KEYS:
+        if line.startswith('{"type":"%s"' % kind):
+            try: found[kind] = json.loads(line).get(key, "") or found.get(kind, "")
+            except Exception: pass
+
+def session_title(path):
+    """/rename title if any, else Claude's ai-title. Both are re-appended as the
+    session grows, so the newest one lives near the end of the file."""
+    found = {}
+    try:
+        with open(path, "rb") as fh:
+            size = os.path.getsize(path)
+            if size > 65536:
+                fh.seek(-65536, 2)
+                fh.readline()  # drop partial line
+            for line in fh.read().decode(errors="replace").splitlines():
+                scan_title(line, found)
+        if len(found) < 2 and size > 65536:  # older titles only in the head
+            with open(path, errors="replace") as fh:
+                head = {}
+                for i, line in enumerate(fh):
+                    if i > 80: break
+                    scan_title(line, head)
+            for k, v in head.items(): found.setdefault(k, v)
+    except OSError:
+        return ""
+    return " ".join((found.get("custom-title") or found.get("ai-title") or "").split())
+
+TITLE_MAX = 200
 shown = 0
 home = os.path.expanduser("~")
 for f in files:
     if shown >= max_n: break
-    sid = cwd = branch = agent = ""
+    sid = cwd = branch = agent = entry = ""
     title = summary = raw = ""
     try:
         with open(f, errors="replace") as fh:
             for i, line in enumerate(fh):
-                if i > 40 or (title and cwd): break
+                if i > 80 or (title and cwd): break
                 try: e = json.loads(line)
                 except Exception: continue
                 if e.get("type") == "summary" and not summary:
@@ -83,23 +160,23 @@ for f in files:
                     cwd = cwd or e.get("cwd", "")
                     branch = branch or (e.get("gitBranch") or "")
                     agent = agent or (e.get("agentName") or "")
+                    entry = entry or (e.get("entrypoint") or "")
                     if not title:
-                        t = first_text(e.get("message", {}).get("content", "")).strip()
-                        if t.startswith("Caveat:"):
-                            t = t.split("\n", 1)[-1].strip()
-                        raw = raw or t
-                        if t and not t.startswith("<"):
-                            title = t
+                        title = typed_prompt(e)
+                        raw = raw or wrapped_text(e)
     except OSError:
         continue
     if not sid or not cwd:
         continue
     is_agent = bool(agent) and agent != "team-lead"
-    if mode == "main" and is_agent:
+    if mode == "main" and (is_agent or entry == "sdk-cli"):  # sdk-cli = headless `claude -p`
         continue
-    if not title and raw:  # e.g. teammate prompts wrapped in injected <tags>
-        title = re.sub(r"<[^>]*>", " ", raw)
-    title = " ".join((title or summary or "(no message)").split())[:120]
+    named = session_title(f)  # searchable; also the fallback when nothing was typed
+    if not title:
+        title = named or summary or raw
+    title = " ".join((title or "(no message)").split())[:TITLE_MAX]
+    if named and named != title:  # dimmed, but part of the fzf search text
+        title += f" {DIM}· {named[:80]}{RESET}"
     proj = cwd.replace(home, "~")
     if len(proj) > 34: proj = "…" + proj[-33:]
     br = f" {YELLOW}{branch[:14]}{RESET}" if branch and branch not in ("main", "master", "HEAD") else ""
@@ -111,6 +188,47 @@ for f in files:
     print(f"{sid}\t{cwd}\t{f}\t{display}")
     shown += 1
 PY
+}
+
+# Full-text search: transcripts (all config dirs, never /subagents/) that contain
+# the query anywhere (rg if installed, else a python scan), listed newest first in the same row format. Fixed-string,
+# case-insensitive; JSON-escaped characters (quotes, newlines) in a transcript
+# won't match a query containing them.
+search_sessions() {  # $2 = all|main like --list; default follows the picker's current list (fzf exports FZF_PROMPT)
+  local q="${1:-}" tmp d mode="${2:-}"
+  [ -n "$mode" ] || { [ "${FZF_PROMPT:-}" = 'main> ' ] && mode=main || mode=all; }
+  [ -n "$q" ] || { list_sessions "$mode"; return; }
+  tmp=$(mktemp)
+  local dirs=()
+  IFS=: read -ra roots <<<"$CS_CONFIG_DIRS"
+  for d in "${roots[@]}"; do [ -d "$d/projects" ] && dirs+=("$d/projects"); done
+  if [ "${#dirs[@]}" -gt 0 ]; then
+    if command -v rg >/dev/null 2>&1; then
+      rg -l -i -F --glob '*.jsonl' --glob '!**/subagents/**' -- "$q" "${dirs[@]}" >"$tmp" 2>/dev/null || true
+    else
+      # No rg: BSD grep -rli takes ~7 s over 800 MB of transcripts; python3 (already
+      # required) does the same scan in ~0.4 s.
+      python3 - "$q" "${dirs[@]}" >"$tmp" <<'PY' || true
+import glob, os, sys
+q = sys.argv[1]
+ascii_q = q.isascii()  # bytes.lower() only folds ASCII; non-ASCII queries need str.casefold()
+qb = q.lower().encode() if ascii_q else None
+qf = None if ascii_q else q.casefold()
+for d in sys.argv[2:]:
+    for f in glob.glob(os.path.join(d, "*", "*.jsonl")):
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read()
+            if ascii_q:
+                if qb in data.lower(): print(f)
+            elif qf in data.decode("utf-8", errors="replace").casefold(): print(f)
+        except OSError:
+            pass
+PY
+    fi
+  fi
+  CS_ONLY_FILES="$tmp" list_sessions "$mode"
+  rm -f "$tmp"
 }
 
 # ------------------------------------------------------------- preview -----
@@ -526,6 +644,7 @@ usage: claude-sessions                    interactive session picker (fzf)
                                          restore newest (or given) snapshot
        claude-sessions --restore-pick    choose a snapshot from history to restore
        claude-sessions --list [all|main] print sessions (tab-separated)
+       claude-sessions --search <text> [all|main]  print sessions whose transcript contains <text>
        claude-sessions --install         set up on this machine (script, PATH, cs alias, snapshot timer)
        claude-sessions --update          refresh installed copy from GitHub
 EOF
@@ -535,6 +654,7 @@ EOF
 # ---------------------------------------------------------------- main -----
 case "${1:-}" in
   --list)       list_sessions "${2:-all}" ;;
+  --search)     search_sessions "${2:-}" "${3:-}" ;;
   --preview)    preview_session "$2" ;;
   --open-line)  open_line "$2" ;;
   --snapshot)      snapshot_state ;;
@@ -546,12 +666,15 @@ case "${1:-}" in
   ?*)              echo "claude-sessions: unknown argument: $1" >&2; usage ;;
   *)
     update_check_bg
-    list_sessions | fzf --ansi --delimiter '\t' --with-nth 4.. \
-      --no-sort --layout=reverse --info=inline \
-      --header 'enter: open in new tab (picker stays)  |  ctrl-a: hide/show ⛭ agents  |  ctrl-r: refresh  |  esc: quit' \
-      --preview "'$SELF' --preview {3}" --preview-window 'right,50%,wrap' \
+    list_sessions main | fzf --ansi --delimiter '\t' --with-nth 4.. --exact --no-hscroll \
+      --prompt 'main> ' --no-sort --layout=reverse --info=inline \
+      --header 'enter: open in new tab (picker stays)  |  ctrl-a: hide/show ⛭ agents + headless runs  |  ctrl-s: full-text search of transcripts  |  ctrl-r: refresh / back to list  |  esc: quit' \
+      --preview "'$SELF' --preview {3}" --preview-window 'down,50%,wrap' \
       --bind "enter:execute-silent('$SELF' --open-line {f})" \
-      --bind "ctrl-r:reload('$SELF' --list all)" \
+      --bind "ctrl-r:change-prompt(main> )+reload('$SELF' --list main)" \
+      --bind "ctrl-s:transform:[ \"\$FZF_PROMPT\" = '> ' ] \
+        && echo \"change-prompt(text> )+reload('$SELF' --search {q} all)+clear-query\" \
+        || echo \"change-prompt(text> )+reload('$SELF' --search {q} main)+clear-query\"" \
       --bind "ctrl-a:transform:[ \"\$FZF_PROMPT\" = 'main> ' ] \
         && echo \"change-prompt(> )+reload('$SELF' --list all)\" \
         || echo \"change-prompt(main> )+reload('$SELF' --list main)\"" \
