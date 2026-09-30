@@ -27,7 +27,7 @@ export CS_CONFIG_DIRS="${CLAUDE_SESSIONS_CONFIG_DIRS:-$HOME/.claude:$HOME/.claud
 
 # ---------------------------------------------------------------- list -----
 # Emits tab-separated lines: session_id <TAB> cwd <TAB> jsonl_path <TAB> display
-# $1 = "all" (default) or "main" (hide teammate/agent sessions)
+# $1 = "all" (default) or "main" (hide teammate/agent sessions and headless `claude -p` runs)
 list_sessions() {
   python3 - "$MAX_SESSIONS" "${1:-all}" <<'PY'
 import glob, json, os, re, signal, sys, time
@@ -145,7 +145,7 @@ shown = 0
 home = os.path.expanduser("~")
 for f in files:
     if shown >= max_n: break
-    sid = cwd = branch = agent = ""
+    sid = cwd = branch = agent = entry = ""
     title = summary = raw = ""
     try:
         with open(f, errors="replace") as fh:
@@ -160,6 +160,7 @@ for f in files:
                     cwd = cwd or e.get("cwd", "")
                     branch = branch or (e.get("gitBranch") or "")
                     agent = agent or (e.get("agentName") or "")
+                    entry = entry or (e.get("entrypoint") or "")
                     if not title:
                         title = typed_prompt(e)
                         raw = raw or wrapped_text(e)
@@ -168,7 +169,7 @@ for f in files:
     if not sid or not cwd:
         continue
     is_agent = bool(agent) and agent != "team-lead"
-    if mode == "main" and is_agent:
+    if mode == "main" and (is_agent or entry == "sdk-cli"):  # sdk-cli = headless `claude -p`
         continue
     named = session_title(f)  # searchable; also the fallback when nothing was typed
     if not title:
@@ -193,9 +194,10 @@ PY
 # the query anywhere (rg if installed, else a python scan), listed newest first in the same row format. Fixed-string,
 # case-insensitive; JSON-escaped characters (quotes, newlines) in a transcript
 # won't match a query containing them.
-search_sessions() {
-  local q="${1:-}" tmp d
-  [ -n "$q" ] || { list_sessions all; return; }
+search_sessions() {  # $2 = all|main like --list; default follows the picker's current list (fzf exports FZF_PROMPT)
+  local q="${1:-}" tmp d mode="${2:-}"
+  [ -n "$mode" ] || { [ "${FZF_PROMPT:-}" = 'main> ' ] && mode=main || mode=all; }
+  [ -n "$q" ] || { list_sessions "$mode"; return; }
   tmp=$(mktemp)
   local dirs=()
   IFS=: read -ra roots <<<"$CS_CONFIG_DIRS"
@@ -219,7 +221,7 @@ for d in sys.argv[2:]:
 PY
     fi
   fi
-  CS_ONLY_FILES="$tmp" list_sessions all
+  CS_ONLY_FILES="$tmp" list_sessions "$mode"
   rm -f "$tmp"
 }
 
@@ -636,7 +638,7 @@ usage: claude-sessions                    interactive session picker (fzf)
                                          restore newest (or given) snapshot
        claude-sessions --restore-pick    choose a snapshot from history to restore
        claude-sessions --list [all|main] print sessions (tab-separated)
-       claude-sessions --search <text>   print sessions whose transcript contains <text>
+       claude-sessions --search <text> [all|main]  print sessions whose transcript contains <text>
        claude-sessions --install         set up on this machine (script, PATH, cs alias, snapshot timer)
        claude-sessions --update          refresh installed copy from GitHub
 EOF
@@ -646,7 +648,7 @@ EOF
 # ---------------------------------------------------------------- main -----
 case "${1:-}" in
   --list)       list_sessions "${2:-all}" ;;
-  --search)     search_sessions "${2:-}" ;;
+  --search)     search_sessions "${2:-}" "${3:-}" ;;
   --preview)    preview_session "$2" ;;
   --open-line)  open_line "$2" ;;
   --snapshot)      snapshot_state ;;
@@ -658,12 +660,12 @@ case "${1:-}" in
   ?*)              echo "claude-sessions: unknown argument: $1" >&2; usage ;;
   *)
     update_check_bg
-    list_sessions | fzf --ansi --delimiter '\t' --with-nth 4.. \
-      --no-sort --layout=reverse --info=inline \
-      --header 'enter: open in new tab (picker stays)  |  ctrl-a: hide/show ⛭ agents  |  ctrl-s: full-text search of transcripts  |  ctrl-r: refresh / back to list  |  esc: quit' \
+    list_sessions main | fzf --ansi --delimiter '\t' --with-nth 4.. --exact --no-hscroll \
+      --prompt 'main> ' --no-sort --layout=reverse --info=inline \
+      --header 'enter: open in new tab (picker stays)  |  ctrl-a: hide/show ⛭ agents + headless runs  |  ctrl-s: full-text search of transcripts  |  ctrl-r: refresh / back to list  |  esc: quit' \
       --preview "'$SELF' --preview {3}" --preview-window 'down,50%,wrap' \
       --bind "enter:execute-silent('$SELF' --open-line {f})" \
-      --bind "ctrl-r:change-prompt(> )+reload('$SELF' --list all)" \
+      --bind "ctrl-r:change-prompt(main> )+reload('$SELF' --list main)" \
       --bind "ctrl-s:change-prompt(text> )+reload('$SELF' --search {q})+clear-query" \
       --bind "ctrl-a:transform:[ \"\$FZF_PROMPT\" = 'main> ' ] \
         && echo \"change-prompt(> )+reload('$SELF' --list all)\" \
