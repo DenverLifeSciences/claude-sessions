@@ -210,12 +210,18 @@ search_sessions() {  # $2 = all|main like --list; default follows the picker's c
       # required) does the same scan in ~0.4 s.
       python3 - "$q" "${dirs[@]}" >"$tmp" <<'PY' || true
 import glob, os, sys
-q = sys.argv[1].lower().encode()
+q = sys.argv[1]
+ascii_q = q.isascii()  # bytes.lower() only folds ASCII; non-ASCII queries need str.casefold()
+qb = q.lower().encode() if ascii_q else None
+qf = None if ascii_q else q.casefold()
 for d in sys.argv[2:]:
     for f in glob.glob(os.path.join(d, "*", "*.jsonl")):
         try:
             with open(f, "rb") as fh:
-                if q in fh.read().lower(): print(f)
+                data = fh.read()
+            if ascii_q:
+                if qb in data.lower(): print(f)
+            elif qf in data.decode("utf-8", errors="replace").casefold(): print(f)
         except OSError:
             pass
 PY
@@ -666,7 +672,9 @@ case "${1:-}" in
       --preview "'$SELF' --preview {3}" --preview-window 'down,50%,wrap' \
       --bind "enter:execute-silent('$SELF' --open-line {f})" \
       --bind "ctrl-r:change-prompt(main> )+reload('$SELF' --list main)" \
-      --bind "ctrl-s:change-prompt(text> )+reload('$SELF' --search {q})+clear-query" \
+      --bind "ctrl-s:transform:[ \"\$FZF_PROMPT\" = '> ' ] \
+        && echo \"change-prompt(text> )+reload('$SELF' --search {q} all)+clear-query\" \
+        || echo \"change-prompt(text> )+reload('$SELF' --search {q} main)+clear-query\"" \
       --bind "ctrl-a:transform:[ \"\$FZF_PROMPT\" = 'main> ' ] \
         && echo \"change-prompt(> )+reload('$SELF' --list all)\" \
         || echo \"change-prompt(main> )+reload('$SELF' --list main)\"" \
