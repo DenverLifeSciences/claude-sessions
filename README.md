@@ -41,13 +41,15 @@ idempotent — rerun them freely.
 ```
 enter   open session in a new tab (picker stays open)
 ctrl-a  hide/show agent-teammate sessions (⛭)
-ctrl-r  refresh the list
+ctrl-s  full-text search of whole transcripts for what you typed in the
+        query box; the list becomes the matching sessions only
+ctrl-r  refresh the list / return from a ctrl-s search to the full list
 esc     quit
 ```
 
 Each line shows the session's age, project directory, account (only when it
 isn't the default one), git branch (when not main/master), and its opening
-message. A preview pane shows the last few
+message (what you typed, not Claude Code's injected wrappers; slash commands show as `/name args`), followed by the session title (`/rename` title, else Claude's auto-generated one) in dim text. Both are searchable; `ctrl-s` searches whole transcripts. A preview pane below the list shows the last few
 user/assistant exchanges of the highlighted session. Resume runs interactively in
 the new tab, so Claude Code's own "resume from summary or full session?" prompt
 appears there.
