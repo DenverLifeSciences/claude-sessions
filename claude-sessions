@@ -418,7 +418,7 @@ return out
 EOF
 ) || true
   SNAP_DUMP="$dump" python3 - "$SNAPSHOT_FILE" "$SNAPSHOT_DIR" <<'PY'
-import glob, json, os, re, subprocess, sys, time
+import datetime, glob, json, os, re, subprocess, sys, time
 
 out_path, snap_dir = sys.argv[1], sys.argv[2]
 
@@ -444,6 +444,36 @@ def is_teammate(sid):
         except OSError:
             pass
     return False
+
+_REG = {}
+def registry():
+    # Claude Code writes <config-dir>/sessions/<pid>.json for every live
+    # session: {"pid","sessionId","cwd","startedAt"(ms),"kind","tmux",...}.
+    # Returns {pid_str: sessionId} for live, interactive sessions only.
+    if _REG: return _REG
+    def proc_start(pid):
+        try:
+            ls = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+            return datetime.datetime.strptime(ls, "%a %b %d %H:%M:%S %Y").timestamp()
+        except Exception:
+            return None
+    for d in os.environ.get("CS_CONFIG_DIRS", "").split(":"):
+        if not d: continue
+        for f in glob.glob(os.path.join(d, "sessions", "*.json")):
+            try: e = json.load(open(f))
+            except Exception: continue
+            pid, sid = e.get("pid"), e.get("sessionId")
+            if not pid or not sid or e.get("kind") != "interactive":
+                continue
+            ps_start = proc_start(pid)
+            if ps_start is None:          # pid gone -> stale registry file
+                continue
+            started = e.get("startedAt")  # guard pid reuse; measured drift <5s
+            if started and abs(ps_start - started / 1000.0) > 120:
+                continue
+            _REG[str(pid)] = sid
+    return _REG
 
 tabs = []
 for line in os.environ.get("SNAP_DUMP", "").splitlines():
@@ -482,28 +512,20 @@ for line in os.environ.get("SNAP_DUMP", "").splitlines():
     cwd = cwd_of(claude_pid or shell_pid) if (claude_pid or shell_pid) else None
     if not cwd: continue
 
-    sid = resume_id
-    if claude_pid and not sid:
-        # exact match: the transcript claude holds open
-        try:
-            out = subprocess.run(["lsof", "-p", claude_pid, "-Fn"],
-                                 capture_output=True, text=True, timeout=10).stdout
-            m = re.search(r"\.claude[^/]*/projects/[^\n]*/([0-9a-f-]{36})\.jsonl", out)
-            if m: sid = m.group(1)
-        except Exception:
-            pass
-    if claude_pid and not sid:
-        # fallback: newest transcript for this cwd's project dir
-        slug = re.sub(r"[/.]", "-", cwd)
-        js = []
-        for d in os.environ.get("CS_CONFIG_DIRS", "").split(":"):
-            if not d: continue
-            proj = os.path.join(d, "projects", slug)
-            try:
-                js += [os.path.join(proj, f) for f in os.listdir(proj) if f.endswith(".jsonl")]
-            except OSError:
-                pass
-        if js: sid = os.path.basename(max(js, key=os.path.getmtime))[:-6]
+    # Registry first — it is authoritative, and it beats both old heuristics:
+    #   - lsof: no recent claude (2.1.259-2.1.270 checked) holds its transcript
+    #     fd open, so that tier matched nothing and always fell through.
+    #   - newest .jsonl for the cwd: collapses every tab sharing a directory
+    #     onto whichever session wrote last, which is usually the wrong one.
+    sid = registry().get(str(claude_pid)) if claude_pid else None
+    if not sid:
+        # Last resort. `--resume <id>` goes stale: resuming FORKS a new session
+        # id, so the id on the command line is the conversation you resumed
+        # FROM, not the one this tab is writing to.
+        sid = resume_id
+    # No further fallback. A tab with no registry entry and no --resume arg has
+    # no session worth restoring; record None so --restore-crash opens a fresh
+    # claude there instead of resuming someone else's conversation.
     if is_teammate(sid):  # subagent/teammate window — not one of the user's
         continue
     tabs.append({"window": win.strip(), "cwd": cwd, "claudeSession": sid})
