@@ -650,6 +650,56 @@ TMUX_PY=/usr/bin/python3; [ -x "$TMUX_PY" ] || TMUX_PY=python3
 TMUX_BIN="${CLAUDE_SESSIONS_TMUX_BIN:-$(command -v tmux 2>/dev/null || echo /opt/homebrew/bin/tmux)}"
 TMUX_LABEL=com.claude.tmux-layout
 TMUX_PLIST="$HOME/Library/LaunchAgents/$TMUX_LABEL.plist"
+# The layout file is rewritten every tick, so after a crash a fresh tmux server would
+# replace it. History keeps the last TMUX_HISTORY_KEEP distinct layouts that still have
+# a resumable session, and restore reads from there.
+TMUX_HISTORY="${CLAUDE_SESSIONS_TMUX_HISTORY:-$HOME/.claude/tmux-layouts}"
+TMUX_HISTORY_KEEP="${CLAUDE_SESSIONS_TMUX_HISTORY_KEEP:-20}"
+
+# Record the just-saved layout in history unless it has no session id to resume
+# (a fresh post-crash tmux server) or equals the newest entry.
+tmux_history_add() {
+  awk -F'\t' '$5 != "" { f = 1 } END { exit !f }' "$TMUX_LAYOUT" || return 0
+  mkdir -p "$TMUX_HISTORY"
+  local files=() new i n
+  shopt -s nullglob; files=("$TMUX_HISTORY"/*.tsv); shopt -u nullglob
+  n=${#files[@]}
+  if [ "$n" -gt 0 ] && cmp -s "${files[n-1]}" "$TMUX_LAYOUT"; then return 0; fi
+  new="$TMUX_HISTORY/$(date +%s).tsv"
+  [ -e "$new" ] || files+=("$new")   # two saves in one second share a name
+  cp "$TMUX_LAYOUT" "$new"
+  n=${#files[@]}
+  for ((i = 0; i < n - TMUX_HISTORY_KEEP; i++)); do rm -f "${files[i]}"; done
+}
+
+# Path of the layout restore/show/export use: the newest history entry, else the layout file.
+tmux_default_layout() {
+  local files=()
+  if [ -n "$TMUX_HISTORY" ]; then
+    shopt -s nullglob; files=("$TMUX_HISTORY"/*.tsv); shopt -u nullglob
+  fi
+  if [ ${#files[@]} -gt 0 ]; then echo "${files[${#files[@]}-1]}"; else echo "$TMUX_LAYOUT"; fi
+}
+
+# Choose an earlier layout from history in fzf; prints its path.
+tmux_pick_layout() {
+  local chosen
+  [ -n "$(ls -A "$TMUX_HISTORY" 2>/dev/null)" ] || { echo "no layout history in $TMUX_HISTORY yet (it fills as the timer runs: claude-sessions tmux install-timer)" >&2; return 1; }
+  command -v fzf >/dev/null || { echo "missing dependency: fzf (brew install fzf)" >&2; return 1; }
+  chosen=$(CS_TMUX_HISTORY="$TMUX_HISTORY" "$TMUX_PY" - <<'PY' | fzf --delimiter '\t' --with-nth 2.. --no-sort \
+    --header 'pick the tmux layout to restore' | cut -f1
+import glob, os, time
+for f in sorted(glob.glob(os.path.join(os.environ["CS_TMUX_HISTORY"], "*.tsv")), reverse=True):
+    rows = [r for r in (l.rstrip("\n").split("\t") for l in open(f)) if len(r) == 5]
+    mins = int((time.time() - int(os.path.basename(f)[:-4])) / 60)
+    age = f"{mins}m" if mins < 60 else (f"{mins//60}h" if mins < 1440 else f"{mins//1440}d")
+    n_claude = sum(1 for r in rows if r[4])
+    names = ", ".join(r[2] for r in rows[:5]) + (", ..." if len(rows) > 5 else "")
+    print(f"{f}\t{age:>4} ago  {len(rows)} windows ({n_claude} claude)  {names}")
+PY
+  ) || true
+  [ -n "$chosen" ] && echo "$chosen"
+}
 
 tmux_save() {
   local filter="${1:-}" tmpf
@@ -768,22 +818,30 @@ PY
   [ -s "$tmpf" ] || { rm -f "$tmpf"; exit 1; }
   mkdir -p "$(dirname "$TMUX_LAYOUT")"
   mv "$tmpf" "$TMUX_LAYOUT"
+  [ -z "$TMUX_HISTORY" ] || tmux_history_add
   echo "saved $(wc -l < "$TMUX_LAYOUT" | tr -d ' ') window(s) -> $TMUX_LAYOUT"
-  tmux_show
+  tmux_show "$TMUX_LAYOUT"
 }
 
-tmux_show() {
-  [[ -f "$TMUX_LAYOUT" ]] || { echo "no layout saved at $TMUX_LAYOUT" >&2; exit 1; }
+tmux_show() {  # [layout-file]; default: the layout restore would use
+  local file="${1:-$(tmux_default_layout)}"
+  [[ -f "$file" ]] || { echo "no layout saved at $file" >&2; exit 1; }
   awk -F'\t' -v home="$HOME" -v ell="…" '{
     d=$4; sub("^" home, "~", d)
     id=($5=="" ? "(fresh)" : substr($5,1,8) ell)
     printf "  %s:%s  %-16s %-34s %s\n", $1, $2, $3, d, id
-  }' "$TMUX_LAYOUT"
+  }' "$file"
 }
 
-tmux_restore() {
-  [[ -f "$TMUX_LAYOUT" ]] || { echo "no layout saved at $TMUX_LAYOUT" >&2; exit 1; }
-    while IFS=$'\t' read -r sess widx wname cwd sid; do
+tmux_restore() {  # [--pick | <layout-file>]; default: the newest saved layout that has a resumable session
+  local file n=0
+  case "${1:-}" in
+    --pick) file=$(tmux_pick_layout) || exit 1 ;;
+    "")     file=$(tmux_default_layout) ;;
+    *)      file="$1" ;;
+  esac
+  [[ -f "$file" ]] || { echo "no layout saved at $file" >&2; exit 1; }
+  while IFS=$'\t' read -r sess widx wname cwd sid; do
     [[ -z "$sess" ]] && continue
     [[ -d "$cwd" ]] || { echo "skip $sess:$widx — missing dir $cwd" >&2; continue; }
     local run="$CLAUDE_BIN"
@@ -795,19 +853,22 @@ tmux_restore() {
     else
       "$TMUX_BIN" new-session -d -s "$sess" -n "$wname" -c "$cwd" "$shellcmd"
     fi
-  done < "$TMUX_LAYOUT"
-  echo "restored. attach with: tmux attach -t $(head -1 "$TMUX_LAYOUT" | cut -f1)"
+    n=$((n + 1))
+  done < "$file"
+  echo "restored $n window(s) from $file"
+  echo "attach with: tmux attach -t $(head -1 "$file" | cut -f1)    (an earlier layout: claude-sessions tmux restore --pick)"
 }
 
 # Printable list of every Claude session id + the folder to resume it from, for
 # saving by hand. Three sections: running in tmux, running outside tmux, and
-# saved-in-layout-but-not-running (everything, after a reboot). The live view goes
-# to a temp file so exporting never overwrites the saved layout.
+# saved-but-not-running (everything, after a reboot), read from the newest saved
+# layout. The live view goes to a temp file, and not into history, so exporting
+# never touches what restore uses.
 tmux_export() {
   local live; live=$(mktemp)
-  ( TMUX_LAYOUT="$live"; tmux_save ) >/dev/null 2>&1 || true
+  ( TMUX_LAYOUT="$live"; TMUX_HISTORY=""; tmux_save ) >/dev/null 2>&1 || true
   local rc=0
-  CS_TMUX_LIVE="$live" CS_TMUX_SAVED="$TMUX_LAYOUT" "$TMUX_PY" - <<'PY' || rc=$?
+  CS_TMUX_LIVE="$live" CS_TMUX_SAVED="$(tmux_default_layout)" "$TMUX_PY" - <<'PY' || rc=$?
 import datetime, glob, json, os, subprocess, sys
 
 home = os.path.expanduser("~")
@@ -918,8 +979,11 @@ usage: claude-sessions tmux <command>
 Save and restore the Claude sessions running in tmux windows.
 
   save [session]    snapshot the tmux windows now (the timer does this every 5 min)
-  show              print the saved layout
-  restore           after a reboot: recreate every saved window, resuming each session
+  show [file]       print the newest saved layout (or the given one)
+  restore [file]    after a reboot: recreate every window of the newest saved layout,
+                    resuming each session
+  restore --pick    choose an earlier layout (the last 20 distinct ones are kept in
+                    ~/.claude/tmux-layouts, so a fresh tmux after a crash can't erase them)
   export            print a list of session ids + folders, to keep by hand
   install-timer     snapshot every 5 min (launchd agent com.claude.tmux-layout)
   uninstall-timer   remove that timer
@@ -930,8 +994,8 @@ EOF
 tmux_main() {
   case "${1:-}" in
     save)            shift; tmux_save "${1:-}" ;;
-    show)            tmux_show ;;
-    restore)         tmux_restore ;;
+    show)            shift; tmux_show "${1:-}" ;;
+    restore)         shift; tmux_restore "${1:-}" ;;
     export)          tmux_export ;;
     install-timer)   tmux_install_timer ;;
     uninstall-timer) tmux_uninstall_timer ;;
@@ -960,7 +1024,7 @@ Recover iTerm tabs after a crash
 
 Recover tmux windows after a reboot       (run `claude-sessions tmux` for details)
   tmux save | show              snapshot / print the saved tmux layout
-  tmux restore                  recreate every saved window, resuming each session
+  tmux restore [--pick]         recreate every saved window, resuming each session
   tmux export                   print session ids + folders, to keep by hand
   tmux install-timer            snapshot tmux windows every 5 min (launchd)
   tmux uninstall-timer          remove that timer
