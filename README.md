@@ -130,7 +130,8 @@ tmux counterpart: it saves each window's name, folder and Claude session id to
 claude-sessions tmux install-timer   # snapshot every 5 min (launchd agent com.claude.tmux-layout)
 claude-sessions tmux save            # snapshot now
 claude-sessions tmux show            # print the saved layout
-claude-sessions tmux restore         # after a reboot: recreate every window, resuming each session
+claude-sessions tmux restore         # after a reboot or crash: recreate every window of the newest saved layout
+claude-sessions tmux restore --pick  # ...or choose an earlier layout from history
 claude-sessions tmux export          # printable list of session ids + folders, to save by hand
 ```
 
@@ -138,9 +139,14 @@ claude-sessions tmux export          # printable list of session ids + folders, 
 session in the saved layout that isn't running. It reads the live state into a
 temp file, so it never overwrites the saved layout.
 
-Run `restore` before starting any other tmux session: the 5-minute timer saves
-whatever tmux is running, so a fresh one-window server would replace the saved
-layout. Session ids come from Claude Code's live session registry
+The timer rewrites `~/.claude/tmux-layout.tsv` every tick, so after a crash a
+fresh tmux server would overwrite it. To survive that, each save also keeps the
+last 20 distinct layouts in `~/.claude/tmux-layouts/` (layouts with no session
+to resume are never kept), and `restore` rebuilds from the newest of those.
+If you'd already started real Claude sessions in a new tmux before restoring,
+`restore --pick` lets you choose the earlier layout. A layout is at most one
+timer interval (5 minutes) old, so windows opened after the last tick aren't in
+it. Session ids come from Claude Code's live session registry
 (`~/.claude/sessions/*.json`), not from the `--resume` argument, which goes stale
 because resuming forks a new session id.
 
