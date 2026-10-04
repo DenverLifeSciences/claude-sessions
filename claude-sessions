@@ -636,6 +636,291 @@ PY
   [ -n "$chosen" ] && restore_crash "$chosen"
 }
 
+# ------------------------------------------------------------------ tmux ---
+# `claude-sessions tmux ...` is the tmux counterpart of --snapshot/--restore-crash.
+# tmux does NOT survive a reboot: the server is a process and dies with everything
+# else, and the iTerm snapshot can't see inside it. This saves what matters
+# (session name, window names, per-window cwd, and the Claude session id running
+# in each) to a plain-text file, and replays it afterwards with
+# `claude --resume <id>` per window.
+TMUX_LAYOUT="${CLAUDE_SESSIONS_TMUX_LAYOUT:-$HOME/.claude/tmux-layout.tsv}"
+# Absolute path: under launchd there is no PATH, and python3 can be a
+# version-manager shim that needs one. The system python3 has every module used here.
+TMUX_PY=/usr/bin/python3; [ -x "$TMUX_PY" ] || TMUX_PY=python3
+TMUX_BIN="${CLAUDE_SESSIONS_TMUX_BIN:-$(command -v tmux 2>/dev/null || echo /opt/homebrew/bin/tmux)}"
+TMUX_LABEL=com.claude.tmux-layout
+TMUX_PLIST="$HOME/Library/LaunchAgents/$TMUX_LABEL.plist"
+
+tmux_save() {
+  local filter="${1:-}" tmpf
+  tmpf=$(mktemp)
+  CS_TMUX_FILTER="$filter" CS_TMUX_BIN="$TMUX_BIN" "$TMUX_PY" - "$tmpf" <<'PY'
+import datetime, glob, json, os, re, subprocess, sys
+
+out_path = sys.argv[1]
+filter_sess = os.environ.get("CS_TMUX_FILTER", "")
+tmux = os.environ.get("CS_TMUX_BIN", "tmux")
+
+# ---------------------------------------------------------------- registry ---
+# Claude Code maintains ~/.claude/sessions/<pid>.json for every live session:
+#   {"pid":.., "sessionId":.., "cwd":.., "startedAt":<epoch ms>,
+#    "kind":"interactive", "tmux":"<sess>:@<win-id>.%<pane-id>", ...}
+# This is authoritative. It beats both older heuristics:
+#   - the `--resume <id>` argument goes stale (resuming forks a NEW session id,
+#     so the id on the command line is last week's conversation, not this one)
+#   - "newest .jsonl in the project dir" collapses every window sharing a cwd
+#     onto whichever session wrote most recently — usually the wrong one.
+def proc_start(pid):
+    try:
+        ls = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+        return datetime.datetime.strptime(ls, "%a %b %d %H:%M:%S %Y").timestamp()
+    except Exception:
+        return None
+
+by_pane, by_pid = {}, {}
+for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    pid, sid = d.get("pid"), d.get("sessionId")
+    if not pid or not sid:
+        continue
+    if d.get("kind") != "interactive":   # skip subagents / non-interactive runs
+        continue
+    # Guard against pid reuse: the live process must have started when the
+    # registry says it did. Measured drift between startedAt and ps lstart is
+    # under 5s; 120s is slack enough to never reject a genuine match.
+    ps_start = proc_start(pid)
+    if ps_start is None:                 # pid is gone -> stale entry
+        continue
+    started = d.get("startedAt")
+    if started and abs(ps_start - started / 1000.0) > 120:
+        continue
+    by_pid[str(pid)] = sid
+    m = re.search(r"(%\d+)$", str(d.get("tmux") or ""))
+    if m:
+        by_pane[m.group(1)] = sid
+
+# -------------------------------------------------------------- tmux panes ---
+fmt = "\t".join("#{%s}" % k for k in (
+    "session_name", "window_index", "window_name", "pane_id",
+    "pane_pid", "pane_current_path", "pane_current_command"))
+try:
+    panes = subprocess.run([tmux, "list-panes", "-a", "-F", fmt],
+                           capture_output=True, text=True, timeout=20).stdout
+except Exception as e:
+    # No tmux server (e.g. the 5-min timer firing before you reattach after a
+    # reboot). Exit non-zero WITHOUT writing, so the last good layout survives.
+    sys.stderr.write("tmux not reachable (%s); keeping previous layout\n" % e)
+    sys.exit(1)
+
+def children(pid):
+    try:
+        return subprocess.run(["pgrep", "-P", str(pid)],
+                              capture_output=True, text=True, timeout=10).stdout.split()
+    except Exception:
+        return []
+
+rows, seen = [], set()
+for line in panes.splitlines():
+    p = line.split("\t")
+    if len(p) != 7:
+        continue
+    sess, widx, wname, pane_id, pane_pid, cwd, pcmd = p
+    if filter_sess and sess != filter_sess:
+        continue
+    if (sess, widx) in seen:             # one row per window, not per pane
+        continue
+
+    sid = by_pane.get(pane_id)                       # 1. registry, by pane id
+    if not sid:                                      # 2. registry, by pid
+        for c in [pane_pid] + children(pane_pid):
+            if c in by_pid:
+                sid = by_pid[c]
+                break
+    if not sid:                                      # 3. --resume argument
+        for c in children(pane_pid):
+            try:
+                args = subprocess.run(["ps", "-o", "command=", "-p", c],
+                                      capture_output=True, text=True, timeout=10).stdout
+            except Exception:
+                continue
+            m = re.search(r"--resume[= ]([0-9a-f-]{36})", args)
+            if m:
+                sid = m.group(1)
+                break
+    # No 4th tier. If the registry has nothing and no id is on the command line,
+    # this window has no Claude session worth resuming — record it with an empty
+    # id so restore opens a fresh `claude` there, rather than guessing wrong.
+
+    if wname == pcmd:    # auto-named window (name == running command) is useless later
+        wname = os.path.basename(cwd)
+    seen.add((sess, widx))
+    rows.append("\t".join((sess, widx, wname, cwd, sid or "")))
+
+if not rows:
+    sys.stderr.write("no tmux panes found; keeping previous layout\n")
+    sys.exit(1)
+open(out_path, "w").write("\n".join(rows) + "\n")
+PY
+  [ -s "$tmpf" ] || { rm -f "$tmpf"; exit 1; }
+  mkdir -p "$(dirname "$TMUX_LAYOUT")"
+  mv "$tmpf" "$TMUX_LAYOUT"
+  echo "saved $(wc -l < "$TMUX_LAYOUT" | tr -d ' ') window(s) -> $TMUX_LAYOUT"
+  tmux_show
+}
+
+tmux_show() {
+  [[ -f "$TMUX_LAYOUT" ]] || { echo "no layout saved at $TMUX_LAYOUT" >&2; exit 1; }
+  awk -F'\t' -v home="$HOME" -v ell="…" '{
+    d=$4; sub("^" home, "~", d)
+    id=($5=="" ? "(fresh)" : substr($5,1,8) ell)
+    printf "  %s:%s  %-16s %-34s %s\n", $1, $2, $3, d, id
+  }' "$TMUX_LAYOUT"
+}
+
+tmux_restore() {
+  [[ -f "$TMUX_LAYOUT" ]] || { echo "no layout saved at $TMUX_LAYOUT" >&2; exit 1; }
+    while IFS=$'\t' read -r sess widx wname cwd sid; do
+    [[ -z "$sess" ]] && continue
+    [[ -d "$cwd" ]] || { echo "skip $sess:$widx — missing dir $cwd" >&2; continue; }
+    local run="$CLAUDE_BIN"
+    [[ -n "$sid" ]] && run="$CLAUDE_BIN --resume $sid"
+    # keep the pane alive after claude exits, so a bad resume isn't a vanished window
+    local shellcmd="cd $(printf %q "$cwd") && $run; exec \$SHELL -l"
+    if "$TMUX_BIN" has-session -t "=$sess" 2>/dev/null; then
+      "$TMUX_BIN" new-window -t "=$sess" -n "$wname" -c "$cwd" "$shellcmd"
+    else
+      "$TMUX_BIN" new-session -d -s "$sess" -n "$wname" -c "$cwd" "$shellcmd"
+    fi
+  done < "$TMUX_LAYOUT"
+  echo "restored. attach with: tmux attach -t $(head -1 "$TMUX_LAYOUT" | cut -f1)"
+}
+
+# Printable list of every Claude session id + the folder to resume it from, for
+# saving by hand. Three sections: running in tmux, running outside tmux, and
+# saved-in-layout-but-not-running (everything, after a reboot). The live view goes
+# to a temp file so exporting never overwrites the saved layout.
+tmux_export() {
+  local live; live=$(mktemp)
+  ( TMUX_LAYOUT="$live"; tmux_save ) >/dev/null 2>&1 || true
+  local rc=0
+  CS_TMUX_LIVE="$live" CS_TMUX_SAVED="$TMUX_LAYOUT" "$TMUX_PY" - <<'PY' || rc=$?
+import datetime, glob, json, os, subprocess, sys
+
+home = os.path.expanduser("~")
+short = lambda p: "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+
+def rows(path):
+    out = []
+    try:
+        for l in open(path):
+            p = l.rstrip("\n").split("\t")
+            if len(p) == 5 and p[0] and p[4]:    # skip fresh windows: no id to export
+                out.append(p)
+    except OSError:
+        pass
+    return out
+
+def proc_start(pid):
+    try:
+        ls = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+        return datetime.datetime.strptime(ls, "%a %b %d %H:%M:%S %Y").timestamp()
+    except Exception:
+        return None
+
+# Live interactive sessions from Claude's registry (same pid-reuse guard as save).
+reg = {}
+for f in glob.glob(home + "/.claude/sessions/*.json"):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    pid, sid = d.get("pid"), d.get("sessionId")
+    if not pid or not sid or d.get("kind") != "interactive":
+        continue
+    ps_start, started = proc_start(pid), d.get("startedAt")
+    if ps_start is None or (started and abs(ps_start - started / 1000.0) > 120):
+        continue
+    reg[sid] = d.get("cwd") or ""
+
+live, saved = rows(os.environ["CS_TMUX_LIVE"]), rows(os.environ["CS_TMUX_SAVED"])
+in_tmux = {r[4] for r in live}
+running = in_tmux | set(reg)
+outside = [(sid, cwd) for sid, cwd in reg.items() if sid not in in_tmux]
+not_running = [r for r in saved if r[4] not in running]
+
+if not (live or outside or not_running):
+    sys.stderr.write("nothing to export: no live sessions and no saved layout\n")
+    sys.exit(1)
+
+def key(r):
+    return (r[0], int(r[1]) if r[1].isdigit() else 0)
+
+print("# Claude sessions - " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+print("# restore: cd <folder> && claude --resume <id>")
+if live:
+    print("\n## running in tmux")
+    for sess, widx, name, cwd, sid in sorted(live, key=key):
+        print(f"{sess + ':' + widx:<10}{name:<16}{sid}   {short(cwd)}")
+if outside:
+    print("\n## running outside tmux")
+    for sid, cwd in sorted(outside, key=lambda x: x[1]):
+        print(f"{'-':<10}{'-':<16}{sid}   {short(cwd)}")
+if not_running:
+    when = datetime.datetime.fromtimestamp(os.path.getmtime(os.environ["CS_TMUX_SAVED"])).strftime("%Y-%m-%d %H:%M")
+    print(f"\n## in saved layout ({when}), not running now")
+    for sess, widx, name, cwd, sid in sorted(not_running, key=key):
+        print(f"{sess + ':' + widx:<10}{name:<16}{sid}   {short(cwd)}")
+PY
+  rm -f "$live"
+  return $rc
+}
+
+tmux_install_timer() {
+  local prog="$INSTALL_PATH"; [ -x "$prog" ] || prog="$SELF"
+  mkdir -p "$(dirname "$TMUX_PLIST")"
+  cat > "$TMUX_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$TMUX_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$prog</string><string>tmux</string><string>save</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>/tmp/claude-tmux-layout.log</string>
+  <key>StandardErrorPath</key><string>/tmp/claude-tmux-layout.log</string>
+</dict>
+</plist>
+PLISTEOF
+  launchctl bootout "gui/$(id -u)/$TMUX_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$TMUX_PLIST"
+  echo "timer loaded (every 5 min) -> $TMUX_LAYOUT   log: /tmp/claude-tmux-layout.log"
+}
+
+tmux_uninstall_timer() {
+  launchctl bootout "gui/$(id -u)/$TMUX_LABEL" 2>/dev/null || true
+  rm -f "$TMUX_PLIST"
+  echo "timer removed"
+}
+
+tmux_main() {
+  case "${1:-}" in
+    save)            shift; tmux_save "${1:-}" ;;
+    show)            tmux_show ;;
+    restore)         tmux_restore ;;
+    export)          tmux_export ;;
+    install-timer)   tmux_install_timer ;;
+    uninstall-timer) tmux_uninstall_timer ;;
+    *)               usage ;;
+  esac
+}
+
 usage() {
   cat >&2 <<'EOF'
 usage: claude-sessions                    interactive session picker (fzf)
@@ -645,6 +930,11 @@ usage: claude-sessions                    interactive session picker (fzf)
        claude-sessions --restore-pick    choose a snapshot from history to restore
        claude-sessions --list [all|main] print sessions (tab-separated)
        claude-sessions --search <text> [all|main]  print sessions whose transcript contains <text>
+       claude-sessions tmux save|show|restore|export
+                                         save/restore the Claude sessions running in tmux windows;
+                                         export prints a list of session ids + folders to keep by hand
+       claude-sessions tmux install-timer|uninstall-timer
+                                         snapshot tmux windows every 5 min (launchd)
        claude-sessions --install         set up on this machine (script, PATH, cs alias, snapshot timer)
        claude-sessions --update          refresh installed copy from GitHub
 EOF
@@ -662,6 +952,7 @@ case "${1:-}" in
   --restore-pick)  pick_snapshot ;;
   --install)       self_install ;;
   --update)        self_update ;;
+  tmux)            shift; tmux_main "$@" ;;
   -h|--help)       usage ;;
   ?*)              echo "claude-sessions: unknown argument: $1" >&2; usage ;;
   *)
