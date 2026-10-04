@@ -118,6 +118,32 @@ pre-crash state survives the reboot. The script installs to a local path
 (`~/.local/bin`) rather than anywhere cloud-synced because macOS denies
 launchd jobs access to cloud-provider paths (iCloud Drive, Dropbox).
 
+## Running Claude in tmux? Use `claude-sessions tmux`
+
+The snapshot above reads iTerm tabs, so it can't see windows inside a tmux
+session — and tmux itself doesn't survive a reboot. `claude-sessions tmux` is the
+tmux counterpart: it saves each window's name, folder and Claude session id to
+`~/.claude/tmux-layout.tsv` and rebuilds the session afterwards, one
+`claude --resume <id>` per window.
+
+```sh
+claude-sessions tmux install-timer   # snapshot every 5 min (launchd agent com.claude.tmux-layout)
+claude-sessions tmux save            # snapshot now
+claude-sessions tmux show            # print the saved layout
+claude-sessions tmux restore         # after a reboot: recreate every window, resuming each session
+claude-sessions tmux export          # printable list of session ids + folders, to save by hand
+```
+
+`export` also lists sessions running outside tmux, and (after a reboot) every
+session in the saved layout that isn't running. It reads the live state into a
+temp file, so it never overwrites the saved layout.
+
+Run `restore` before starting any other tmux session: the 5-minute timer saves
+whatever tmux is running, so a fresh one-window server would replace the saved
+layout. Session ids come from Claude Code's live session registry
+(`~/.claude/sessions/*.json`), not from the `--resume` argument, which goes stale
+because resuming forks a new session id.
+
 ## Caveats
 
 - The `~/.claude/projects` layout is undocumented internal storage — a Claude Code update could change it. The script only reads these files; worst case the picker breaks, never your sessions.
