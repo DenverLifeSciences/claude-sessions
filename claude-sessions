@@ -909,6 +909,24 @@ tmux_uninstall_timer() {
   echo "timer removed"
 }
 
+tmux_usage() {  # $1 = exit code: 0 (asked for) prints to stdout, otherwise stderr
+  local rc="${1:-2}" fd=2
+  [ "$rc" -eq 0 ] && fd=1
+  cat >&"$fd" <<'EOF'
+usage: claude-sessions tmux <command>
+
+Save and restore the Claude sessions running in tmux windows.
+
+  save [session]    snapshot the tmux windows now (the timer does this every 5 min)
+  show              print the saved layout
+  restore           after a reboot: recreate every saved window, resuming each session
+  export            print a list of session ids + folders, to keep by hand
+  install-timer     snapshot every 5 min (launchd agent com.claude.tmux-layout)
+  uninstall-timer   remove that timer
+EOF
+  exit "$rc"
+}
+
 tmux_main() {
   case "${1:-}" in
     save)            shift; tmux_save "${1:-}" ;;
@@ -917,28 +935,42 @@ tmux_main() {
     export)          tmux_export ;;
     install-timer)   tmux_install_timer ;;
     uninstall-timer) tmux_uninstall_timer ;;
-    *)               usage ;;
+    ""|-h|--help)    tmux_usage 0 ;;
+    *)               echo "claude-sessions tmux: unknown command: $1" >&2; tmux_usage ;;
   esac
 }
 
-usage() {
-  cat >&2 <<'EOF'
-usage: claude-sessions                    interactive session picker (fzf)
-       claude-sessions --snapshot        snapshot iTerm tabs + claude sessions
-       claude-sessions --restore-crash [file]
-                                         restore newest (or given) snapshot
-       claude-sessions --restore-pick    choose a snapshot from history to restore
-       claude-sessions --list [all|main] print sessions (tab-separated)
-       claude-sessions --search <text> [all|main]  print sessions whose transcript contains <text>
-       claude-sessions tmux save|show|restore|export
-                                         save/restore the Claude sessions running in tmux windows;
-                                         export prints a list of session ids + folders to keep by hand
-       claude-sessions tmux install-timer|uninstall-timer
-                                         snapshot tmux windows every 5 min (launchd)
-       claude-sessions --install         set up on this machine (script, PATH, cs alias, snapshot timer)
-       claude-sessions --update          refresh installed copy from GitHub
+usage() {  # $1 = exit code: 0 (asked for) prints to stdout, otherwise stderr
+  local rc="${1:-2}" fd=2
+  [ "$rc" -eq 0 ] && fd=1
+  cat >&"$fd" <<'EOF'
+claude-sessions: find and resume Claude Code sessions, and rebuild your terminal after a reboot.
+
+usage: claude-sessions [command]
+
+Find a session
+  (no command)                  interactive session picker (fzf)
+  --list [all|main]             print sessions (tab-separated)
+  --search <text> [all|main]    print sessions whose transcript contains <text>
+
+Recover iTerm tabs after a crash
+  --snapshot                    snapshot iTerm tabs + Claude sessions now
+  --restore-crash [file]        restore the newest (or the given) snapshot
+  --restore-pick                choose a snapshot from history to restore
+
+Recover tmux windows after a reboot       (run `claude-sessions tmux` for details)
+  tmux save | show              snapshot / print the saved tmux layout
+  tmux restore                  recreate every saved window, resuming each session
+  tmux export                   print session ids + folders, to keep by hand
+  tmux install-timer            snapshot tmux windows every 5 min (launchd)
+  tmux uninstall-timer          remove that timer
+
+Set up
+  --install                     install the script, PATH, `cs` alias and iTerm snapshot timer
+  --update                      refresh the installed copy from GitHub
+  -h, --help                    show this help
 EOF
-  exit 2
+  exit "$rc"
 }
 
 # ---------------------------------------------------------------- main -----
@@ -953,7 +985,7 @@ case "${1:-}" in
   --install)       self_install ;;
   --update)        self_update ;;
   tmux)            shift; tmux_main "$@" ;;
-  -h|--help)       usage ;;
+  -h|--help)       usage 0 ;;
   ?*)              echo "claude-sessions: unknown argument: $1" >&2; usage ;;
   *)
     update_check_bg
