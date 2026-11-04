@@ -849,7 +849,7 @@ tmux_restore() {  # [--pick | <layout-file>]; default: the newest saved layout t
     # keep the pane alive after claude exits, so a bad resume isn't a vanished window
     local shellcmd="cd $(printf %q "$cwd") && $run; exec \$SHELL -l"
     if "$TMUX_BIN" has-session -t "=$sess" 2>/dev/null; then
-      "$TMUX_BIN" new-window -t "=$sess" -n "$wname" -c "$cwd" "$shellcmd"
+      "$TMUX_BIN" new-window -t "=$sess:" -n "$wname" -c "$cwd" "$shellcmd"
     else
       "$TMUX_BIN" new-session -d -s "$sess" -n "$wname" -c "$cwd" "$shellcmd"
     fi
